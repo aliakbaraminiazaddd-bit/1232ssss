@@ -7413,6 +7413,85 @@ async def admin_discount_expire(update: Update, context: ContextTypes.DEFAULT_TY
     return await _save_discount_code(update, context, hours, from_callback=False)
 
 
+def _format_campaign_duration(hours: int) -> str:
+    if hours <= 0:
+        return "بدون محدودیت زمانی"
+    if hours >= 24:
+        days = hours // 24
+        rem = hours % 24
+        if rem:
+            return f"{days} روز و {rem} ساعت"
+        return f"{days} روز"
+    return f"{hours} ساعت"
+
+
+def build_campaign_promo_message(code: str, percent: int, hours: int, max_uses: int) -> str:
+    """متن تبلیغاتی زیبا برای کمپین کد تخفیف"""
+    now = datetime.now()
+    duration = _format_campaign_duration(hours)
+    if hours > 0:
+        exp_dt = now + timedelta(hours=hours)
+        deadline = exp_dt.strftime("%Y/%m/%d — %H:%M")
+        urgency = (
+            f"⏳ فقط تا <b>{deadline}</b>\n"
+            f"🕐 مدت اعتبار: <b>{duration}</b>"
+        )
+    else:
+        urgency = "⏰ اعتبار: بدون محدودیت زمانی"
+
+    if max_uses == 0:
+        capacity = "ظرفیت استفاده: <b>نامحدود</b>"
+    elif max_uses == 1:
+        capacity = "ظرفیت: <b>فقط ۱ نفر</b> — زودتر اقدام کنید!"
+    else:
+        capacity = f"ظرفیت محدود: فقط <b>{max_uses}</b> نفر"
+
+    # نوار تخفیف بصری
+    bar = "🔥" * min(10, max(3, percent // 10))
+
+    return (
+        f"✨ <b>کمپین ویژه تخفیف فعال شد!</b> ✨\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{bar}\n"
+        f"🏷 تخفیف اختصاصی: <b>{percent}٪</b>\n"
+        f"🎟 کد تخفیف:\n"
+        f"<code>{code}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{urgency}\n"
+        f"{capacity}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🛒 چطور استفاده کنم؟\n"
+        f"۱) وارد ربات شو و «خرید سرویس» را بزن\n"
+        f"۲) پلن مورد نظرت را انتخاب کن\n"
+        f"۳) روی «🎟 اعمال کد تخفیف» بزن\n"
+        f"۴) کد <code>{code}</code> را وارد کن\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💎 همین حالا سرویس بگیر و از تخفیف {percent}٪ استفاده کن!\n"
+        f"🚀 فرصت محدوده — از دستش نده 👇"
+    )
+
+
+async def broadcast_campaign_to_users(bot, promo_text: str) -> tuple:
+    """ارسال کمپین به همه کاربران غیربن. برمی‌گرداند (موفق، ناموفق)"""
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cur:
+            users = await cur.fetchall()
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 خرید سرویس با تخفیف", callback_data="buy_service")],
+        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main")],
+    ])
+    ok, fail = 0, 0
+    for (uid,) in users:
+        try:
+            await bot.send_message(uid, promo_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    return ok, fail
+
+
 async def _save_discount_code(update, context, hours: int, from_callback: bool = False):
     code = context.user_data.get("new_disc_code")
     percent = context.user_data.get("new_disc_percent")
@@ -7449,10 +7528,7 @@ async def _save_discount_code(update, context, hours: int, from_callback: bool =
 
     if hours > 0:
         exp_dt = now + timedelta(hours=hours)
-        if hours >= 24:
-            time_txt = f"{hours // 24} روز" + (f" و {hours % 24} ساعت" if hours % 24 else "")
-        else:
-            time_txt = f"{hours} ساعت"
+        time_txt = _format_campaign_duration(hours)
         expire_txt = f"⏰ اعتبار: <b>{time_txt}</b> (تا {exp_dt.strftime('%Y-%m-%d %H:%M')})"
     else:
         expire_txt = "⏰ اعتبار: <b>بدون انقضا</b>"
@@ -7466,14 +7542,77 @@ async def _save_discount_code(update, context, hours: int, from_callback: bool =
         f"🔢 ظرفیت: {limit_txt}\n"
         f"{expire_txt}"
     )
-    if from_callback:
-        await update.callback_query.edit_message_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+
+    # اگر زمان‌دار باشد → کمپین همگانی خودکار
+    if hours > 0:
+        text += "\n\n📢 در حال ارسال پیام تبلیغاتی به همه کاربران..."
+        if from_callback:
+            await update.callback_query.edit_message_text(
+                text, parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+        promo = build_campaign_promo_message(code, percent, hours, limit)
+        bot = context.bot
+        try:
+            ok, fail = await broadcast_campaign_to_users(bot, promo)
+            result = (
+                f"✅ <b>کد تخفیف / کمپین ساخته شد</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🎟 کد: <code>{code}</code>\n"
+                f"💰 تخفیف: <b>{percent}٪</b>\n"
+                f"🔢 ظرفیت: {limit_txt}\n"
+                f"{expire_txt}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📢 کمپین همگانی ارسال شد\n"
+                f"✅ موفق: <b>{ok}</b> نفر\n"
+                f"❌ ناموفق: <b>{fail}</b> نفر"
+            )
+        except Exception as e:
+            logger.error(f"campaign broadcast: {e}")
+            result = text + f"\n\n⚠️ خطا در ارسال همگانی:\n{str(e)[:120]}"
+
+        # پیش‌نمایش متن تبلیغاتی برای ادمین
+        preview = (
+            f"\n\n📝 <b>پیش‌نمایش پیام ارسالی:</b>\n"
+            f"—————————————\n"
+            f"{promo}"
         )
+        # اگر خیلی طولانی شد، جدا بفرست
+        full = result + preview
+        if len(full) > 3900:
+            if from_callback:
+                await update.callback_query.edit_message_text(
+                    result, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+                )
+            else:
+                await update.message.reply_text(
+                    result, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+                )
+            await context.bot.send_message(
+                update.effective_user.id,
+                f"📝 <b>پیش‌نمایش پیام کمپین:</b>\n━━━━━━━━━━━━━━━━━━\n{promo}",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            if from_callback:
+                await update.callback_query.edit_message_text(
+                    full, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+                )
+            else:
+                await update.message.reply_text(
+                    full, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+                )
     else:
-        await update.message.reply_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
-        )
+        if from_callback:
+            await update.callback_query.edit_message_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+            )
+        else:
+            await update.message.reply_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+            )
 
     for k in ("new_disc_code", "new_disc_percent", "new_disc_limit"):
         context.user_data.pop(k, None)
@@ -8826,22 +8965,66 @@ async def admin_do_search_user(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(msg, reply_markup=kb, parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
+async def send_db_backup(bot, chat_id: int = None, caption_prefix: str = "💾 بک‌آپ دیتابیس") -> bool:
+    """ارسال فایل bot.db به چت مشخص (پیش‌فرض: ادمین اصلی)"""
+    target = chat_id or ADMIN_ID
+    try:
+        if not os.path.exists("bot.db"):
+            await bot.send_message(target, "❌ فایل bot.db یافت نشد.")
+            return False
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        with open("bot.db", "rb") as f:
+            await bot.send_document(
+                chat_id=target,
+                document=InputFile(f, filename=f"bot_backup_{stamp}.db"),
+                caption=(
+                    f"{caption_prefix}\n"
+                    f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                    f"📦 اندازه: {os.path.getsize('bot.db') / 1024:.1f} KB"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        return True
+    except Exception as e:
+        logger.error(f"send_db_backup: {e}")
+        try:
+            await bot.send_message(target, f"❌ خطا در ارسال بک‌آپ:\n{str(e)[:200]}")
+        except Exception:
+            pass
+        return False
+
+
+async def auto_backup_db(context: ContextTypes.DEFAULT_TYPE):
+    """جاب روزانه: بک‌آپ خودکار دیتابیس برای ادمین"""
+    try:
+        ok = await send_db_backup(
+            context.bot,
+            ADMIN_ID,
+            caption_prefix="💾 <b>بک‌آپ خودکار روزانه</b>",
+        )
+        if ok:
+            logger.info("Auto DB backup sent to admin.")
+    except Exception as e:
+        logger.error(f"auto_backup_db: {e}")
+
+
 async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not await is_admin(query.from_user.id):
         return
     try:
-        with open("bot.db", "rb") as f:
-            await context.bot.send_document(
-                chat_id=ADMIN_ID,
-                document=InputFile(f, filename="bot_backup.db"),
-                caption=f"💾 بک‌آپ دیتابیس\n🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        ok = await send_db_backup(context.bot, query.from_user.id)
+        if ok:
+            await query.edit_message_text(
+                "✅ فایل بک‌آپ دیتابیس ارسال شد.",
+                reply_markup=InlineKeyboardMarkup([[back_button("admin_panel")]])
             )
-        await query.edit_message_text(
-            "✅ فایل بک‌آپ دیتابیس ارسال شد.",
-            reply_markup=InlineKeyboardMarkup([[back_button("admin_panel")]])
-        )
+        else:
+            await query.edit_message_text(
+                "❌ ارسال بک‌آپ ناموفق بود.",
+                reply_markup=InlineKeyboardMarkup([[back_button("admin_panel")]])
+            )
     except Exception as e:
         await query.edit_message_text(
             f"❌ خطا در ارسال بک‌آپ: {e}",
@@ -9940,16 +10123,22 @@ def main():
             app.job_queue.run_repeating(check_usage_and_expire, interval=3600, first=60)
             app.job_queue.run_repeating(cleanup_old_tests, interval=86400, first=120)
             app.job_queue.run_repeating(cleanup_expired_configs, interval=21600, first=300)  # هر ۶ ساعت
-            # گزارش مالی روزانه ساعت ۲۳:۵۵
             try:
                 from datetime import time as dt_time
+                # گزارش مالی روزانه ساعت ۲۳:۵۵
                 app.job_queue.run_daily(
                     send_daily_finance_report,
                     time=dt_time(hour=23, minute=55, second=0),
                     name="daily_finance_report",
                 )
+                # بک‌آپ خودکار دیتابیس هر روز ساعت ۰۳:۰۰
+                app.job_queue.run_daily(
+                    auto_backup_db,
+                    time=dt_time(hour=3, minute=0, second=0),
+                    name="daily_db_backup",
+                )
             except Exception as e:
-                logger.error(f"schedule daily finance report: {e}")
+                logger.error(f"schedule daily jobs: {e}")
             logger.info("Background jobs started.")
 
     application.post_init = post_init
