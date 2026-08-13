@@ -819,7 +819,10 @@ async def maybe_grant_loyalty_gift(bot, user_id: int):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⏳ زمان: {config['expire']}", callback_data="noop")],
             [InlineKeyboardButton(f"📊 حجم: {config['volume']}", callback_data="noop")],
-            [InlineKeyboardButton("📷 دریافت QR CODE", callback_data=f"qr_{order_id}")],
+            [
+                InlineKeyboardButton("📷 QR CODE", callback_data=f"qr_{order_id}"),
+                InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
+            ],
             [InlineKeyboardButton("📖 آموزش استفاده", callback_data=f"guide_{order_id}")],
             [back_button()],
         ])
@@ -2428,7 +2431,10 @@ async def pay_with_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⏳ زمان: {config['expire']}", callback_data="noop")],
             [InlineKeyboardButton(f"📊 حجم: {config['volume']}", callback_data="noop")],
-            [InlineKeyboardButton("📷 دریافت QR CODE", callback_data=f"qr_{order_id}")],
+            [
+                InlineKeyboardButton("📷 QR CODE", callback_data=f"qr_{order_id}"),
+                InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
+            ],
             [InlineKeyboardButton("📖 آموزش استفاده", callback_data=f"guide_{order_id}")],
             [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")],
             [back_button()]
@@ -2637,7 +2643,10 @@ async def approve_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"⏳ زمان: {config['expire']}", callback_data="noop")],
             [InlineKeyboardButton(f"📊 حجم: {config['volume']}", callback_data="noop")],
-            [InlineKeyboardButton("📷 دریافت QR CODE", callback_data=f"qr_{order_id}")],
+            [
+                InlineKeyboardButton("📷 QR CODE", callback_data=f"qr_{order_id}"),
+                InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
+            ],
             [InlineKeyboardButton("📖 آموزش استفاده", callback_data=f"guide_{order_id}")],
             [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")],
             [back_button()]
@@ -4121,7 +4130,10 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             conf = json.loads(conf_data)
             text += f"\n\n🔗 لینک اشتراک:\n<code>{conf.get('subscription_url', '—')}</code>"
-            kb.insert(0, [InlineKeyboardButton("📷 QR Code", callback_data=f"qr_{order_id}")])
+            kb.insert(0, [
+                InlineKeyboardButton("📷 QR Code", callback_data=f"qr_{order_id}"),
+                InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
+            ])
             kb.insert(1, [InlineKeyboardButton("📖 آموزش", callback_data=f"guide_{order_id}")])
             kb.insert(2, [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")])
             toggle_label = "🔴 خاموش کردن تمدید خودکار" if auto_renew else "🟢 روشن کردن تمدید خودکار"
@@ -5432,6 +5444,82 @@ async def send_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         await query.answer("اطلاعات یافت نشد", show_alert=True)
 
+
+async def send_config_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ارسال فایل .txt کانفیگ (لینک ساب + لینک مستقیم)"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # dlcfg_123
+    try:
+        order_id = int(data.split("_")[1])
+    except Exception:
+        await query.answer("سفارش نامعتبر", show_alert=True)
+        return
+
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute(
+            """SELECT config_data, config_name, panel_username, server_type, volume_gb
+               FROM orders WHERE id = ? AND user_id = ? AND status = 'paid'""",
+            (order_id, query.from_user.id)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row or not row[0]:
+        await query.answer("اطلاعات کانفیگ یافت نشد", show_alert=True)
+        return
+
+    conf_data_str, conf_name, panel_username, server_type, vol = row
+    try:
+        conf = json.loads(conf_data_str)
+    except Exception:
+        await query.answer("خطا در خواندن کانفیگ", show_alert=True)
+        return
+
+    username = conf.get("username") or panel_username or conf_name or "user"
+    sub_url = conf.get("subscription_url") or ""
+    config_link = conf.get("config_link") or ""
+    expire = conf.get("expire") or "—"
+    volume = conf.get("volume") or (f"{vol} گیگ" if vol else "—")
+    server_label = {
+        "holland": "هلند",
+        "multi": "مولتی",
+        "unlimited": "نامحدود",
+        "custom": "دلخواه",
+    }.get(server_type or "", server_type or "—")
+
+    lines = [
+        f"# Nexro Config — Order #{order_id}",
+        f"# Username: {username}",
+        f"# Server: {server_label}",
+        f"# Volume: {volume}",
+        f"# Expire: {expire}",
+        f"#",
+        f"# Subscription URL:",
+        sub_url,
+    ]
+    if config_link and config_link != sub_url:
+        lines.append("#")
+        lines.append("# Direct config link:")
+        lines.append(config_link)
+    lines.append("")
+    content = "\n".join(lines)
+
+    bio = BytesIO(content.encode("utf-8"))
+    bio.name = f"config_{username}.txt"
+    bio.seek(0)
+
+    await query.message.reply_document(
+        document=InputFile(bio, filename=f"config_{username}.txt"),
+        caption=(
+            f"📄 <b>فایل کانفیگ</b>\n"
+            f"👤 <code>{username}</code>\n"
+            f"🔗 لینک داخل فایل ذخیره شده است.\n"
+            f"می‌توانید فایل را در کلاینت Import کنید یا لینک را کپی کنید."
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def guide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5526,7 +5614,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📉 کسر همه", callback_data="admin_deduct_all")
         ])
         buttons.append([
-            InlineKeyboardButton("📊 آمار پیشرفته", callback_data="admin_stats"),
+            InlineKeyboardButton("📊 گزارش مالی", callback_data="admin_stats"),
             InlineKeyboardButton("⏳ سفارشات در انتظار", callback_data="admin_pending_orders")
         ])
         buttons.append([
@@ -6656,142 +6744,239 @@ async def admin_view_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         text_msg,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 داشبورد آمار", callback_data="admin_stats")],
+            [InlineKeyboardButton("📊 گزارش مالی", callback_data="admin_stats")],
             [back_button("admin_panel")],
         ]),
         parse_mode=ParseMode.HTML,
     )
 
 
+async def build_finance_report(period: str = "today") -> str:
+    """
+    ساخت متن گزارش مالی.
+    period: today | yesterday | week | month | all
+    """
+    now = datetime.now()
+    today_start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = today_start_dt.isoformat()
+    yesterday_start = (today_start_dt - timedelta(days=1)).isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+    month_ago = (now - timedelta(days=30)).isoformat()
+
+    if period == "today":
+        period_start = today_start
+        period_end = None
+        period_label = f"امروز ({now.strftime('%Y-%m-%d')})"
+    elif period == "yesterday":
+        period_start = yesterday_start
+        period_end = today_start
+        period_label = f"دیروز ({(today_start_dt - timedelta(days=1)).strftime('%Y-%m-%d')})"
+    elif period == "week":
+        period_start = week_ago
+        period_end = None
+        period_label = "۷ روز اخیر"
+    elif period == "month":
+        period_start = month_ago
+        period_end = None
+        period_label = "۳۰ روز اخیر"
+    else:
+        period_start = None
+        period_end = None
+        period_label = "کل دوره"
+
+    def _range_sql(col="created_at"):
+        if period_start and period_end:
+            return f" AND {col} >= ? AND {col} < ?", (period_start, period_end)
+        if period_start:
+            return f" AND {col} >= ?", (period_start,)
+        return "", ()
+
+    async with aiosqlite.connect("bot.db") as db:
+        # کاربران
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            total_users = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1") as cur:
+            banned_users = (await cur.fetchone())[0]
+        async with db.execute("SELECT COALESCE(SUM(balance), 0) FROM users") as cur:
+            total_balance = (await cur.fetchone())[0]
+
+        # سفارش سرویس در بازه
+        extra, params = _range_sql()
+        async with db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(final_price), 0) FROM orders WHERE status = 'paid'{extra}",
+            params,
+        ) as cur:
+            paid_count, paid_rev = await cur.fetchone()
+
+        # تمدید خودکار در بازه
+        auto_extra = extra
+        auto_params = params
+        async with db.execute(
+            f"""SELECT COUNT(*), COALESCE(SUM(final_price), 0) FROM orders
+                WHERE status = 'paid'
+                  AND (config_data LIKE '%"type": "auto_renew"%' OR config_data LIKE '%"type":"auto_renew"%')
+                  {auto_extra}""",
+            auto_params,
+        ) as cur:
+            auto_count, auto_rev = await cur.fetchone()
+
+        # هدیه کد در بازه
+        async with db.execute(
+            f"""SELECT COUNT(*) FROM orders
+                WHERE status = 'paid'
+                  AND (config_data LIKE '%"type": "gift_code"%' OR config_data LIKE '%"type":"gift_code"%')
+                  {extra}""",
+            params,
+        ) as cur:
+            gift_count = (await cur.fetchone())[0]
+
+        # پروکسی
+        px_extra, px_params = _range_sql()
+        async with db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(final_price), 0) FROM proxy_orders WHERE status = 'paid'{px_extra}",
+            px_params,
+        ) as cur:
+            proxy_count, proxy_rev = await cur.fetchone()
+
+        # شارژ کیف پول
+        # وضعیت‌های رایج: paid / approved
+        w_extra, w_params = _range_sql()
+        async with db.execute(
+            f"""SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM wallet_charges
+                WHERE status IN ('paid', 'approved'){w_extra}""",
+            w_params,
+        ) as cur:
+            wallet_count, wallet_sum = await cur.fetchone()
+
+        # در انتظار
+        async with db.execute("SELECT COUNT(*) FROM orders WHERE status = 'pending'") as cur:
+            pending_orders = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM proxy_orders WHERE status = 'pending'") as cur:
+            pending_proxy = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM wallet_charges WHERE status = 'pending'") as cur:
+            pending_charges = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'") as cur:
+            open_tickets = (await cur.fetchone())[0]
+
+        # انبار پروکسی
+        async with db.execute("SELECT COUNT(*) FROM proxy_stock WHERE is_sold = 0") as cur:
+            proxy_stock = (await cur.fetchone())[0]
+
+        # کل (برای مقایسه)
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(final_price), 0) FROM orders WHERE status = 'paid'"
+        ) as cur:
+            all_paid_count, all_paid_rev = await cur.fetchone()
+        async with db.execute(
+            "SELECT COALESCE(SUM(final_price), 0) FROM proxy_orders WHERE status = 'paid'"
+        ) as cur:
+            all_proxy_rev = (await cur.fetchone())[0]
+
+        # کاربران جدید در بازه
+        u_extra, u_params = _range_sql("join_date")
+        async with db.execute(
+            f"SELECT COUNT(*) FROM users WHERE 1=1{u_extra}",
+            u_params,
+        ) as cur:
+            new_users = (await cur.fetchone())[0]
+
+        # کد تخفیف فعال
+        async with db.execute(
+            "SELECT COUNT(*) FROM discount_codes WHERE is_active = 1"
+        ) as cur:
+            active_discounts = (await cur.fetchone())[0]
+
+    period_total = (paid_rev or 0) + (proxy_rev or 0)
+    all_total = (all_paid_rev or 0) + (all_proxy_rev or 0)
+
+    text = (
+        f"📊 <b>گزارش مالی</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📅 بازه: <b>{period_label}</b>\n"
+        f"🕐 زمان گزارش: {now.strftime('%Y-%m-%d %H:%M')}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>فروش سرویس</b>\n"
+        f"   تعداد: <b>{paid_count:,}</b>\n"
+        f"   مبلغ: <b>{(paid_rev or 0):,}</b> تومان\n"
+        f"🔄 تمدید خودکار: <b>{auto_count:,}</b> ({(auto_rev or 0):,} ت)\n"
+        f"🎁 کد هدیه استفاده‌شده: <b>{gift_count:,}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 <b>فروش پروکسی</b>\n"
+        f"   تعداد: <b>{proxy_count:,}</b>\n"
+        f"   مبلغ: <b>{(proxy_rev or 0):,}</b> تومان\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💳 <b>شارژ کیف پول</b>\n"
+        f"   تعداد: <b>{wallet_count:,}</b>\n"
+        f"   مبلغ: <b>{(wallet_sum or 0):,}</b> تومان\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>جمع فروش این بازه</b>\n"
+        f"   سرویس + پروکسی: <b>{period_total:,}</b> تومان\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👥 کاربران جدید: <b>{new_users:,}</b>\n"
+        f"👥 کل کاربران: <b>{total_users:,}</b> | 🚫 بن: <b>{banned_users:,}</b>\n"
+        f"💰 موجودی کل کیف پول‌ها: <b>{total_balance:,}</b> ت\n"
+        f"📦 انبار پروکسی: <b>{proxy_stock:,}</b>\n"
+        f"🎟 کد تخفیف فعال: <b>{active_discounts:,}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ در انتظار — سرویس: {pending_orders} | پروکسی: {pending_proxy} | شارژ: {pending_charges}\n"
+        f"🎫 تیکت باز: {open_tickets}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📦 کل سفارشات پرداخت‌شده: <b>{all_paid_count:,}</b>\n"
+        f"💵 درآمد کل (سرویس+پروکسی): <b>{all_total:,}</b> تومان"
+    )
+    return text
+
+
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """گزارش مالی — پیش‌فرض امروز + دکمه‌های بازه"""
     query = update.callback_query
     await query.answer()
     if not await is_admin(query.from_user.id):
         return
 
-    now = datetime.now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    week_ago = (now - timedelta(days=7)).isoformat()
-    month_ago = (now - timedelta(days=30)).isoformat()
+    period = "today"
+    if query.data and query.data.startswith("finance_"):
+        period = query.data.replace("finance_", "") or "today"
 
-    async with aiosqlite.connect("bot.db") as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            total_users = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1") as cur:
-            banned_users = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE test_used = 1") as cur:
-            test_used = (await cur.fetchone())[0]
-        async with db.execute("SELECT COALESCE(SUM(balance), 0) FROM users") as cur:
-            total_balance = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM orders WHERE status = 'pending'") as cur:
-            pending_orders = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM orders WHERE status = 'paid'") as cur:
-            paid_orders = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM orders WHERE status = 'rejected'") as cur:
-            rejected_orders = (await cur.fetchone())[0]
-        async with db.execute("SELECT COALESCE(SUM(final_price), 0) FROM orders WHERE status = 'paid'") as cur:
-            total_revenue = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM wallet_charges WHERE status = 'pending'") as cur:
-            pending_charges = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM discount_codes WHERE is_active = 1") as cur:
-            active_discounts = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'") as cur:
-            open_tickets = (await cur.fetchone())[0]
+    text = await build_finance_report(period)
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 امروز", callback_data="finance_today"),
+            InlineKeyboardButton("📆 دیروز", callback_data="finance_yesterday"),
+        ],
+        [
+            InlineKeyboardButton("🗓 ۷ روز", callback_data="finance_week"),
+            InlineKeyboardButton("🗓 ۳۰ روز", callback_data="finance_month"),
+        ],
+        [InlineKeyboardButton("📊 کل دوره", callback_data="finance_all")],
+        [InlineKeyboardButton("📋 لاگ ادمین‌ها", callback_data="admin_logs")],
+        [back_button("admin_panel")],
+    ])
+    try:
+        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        await context.bot.send_message(
+            query.from_user.id, text, reply_markup=kb, parse_mode=ParseMode.HTML
+        )
 
-        # درآمد امروز
-        async with db.execute(
-            "SELECT COALESCE(SUM(final_price), 0) FROM orders WHERE status = 'paid' AND created_at >= ?",
-            (today_start,)
-        ) as cur:
-            today_revenue = (await cur.fetchone())[0]
-        # درآمد هفته
-        async with db.execute(
-            "SELECT COALESCE(SUM(final_price), 0) FROM orders WHERE status = 'paid' AND created_at >= ?",
-            (week_ago,)
-        ) as cur:
-            week_revenue = (await cur.fetchone())[0]
-        # درآمد ماه
-        async with db.execute(
-            "SELECT COALESCE(SUM(final_price), 0) FROM orders WHERE status = 'paid' AND created_at >= ?",
-            (month_ago,)
-        ) as cur:
-            month_revenue = (await cur.fetchone())[0]
-        # تعداد سفارش امروز
-        async with db.execute(
-            "SELECT COUNT(*) FROM orders WHERE status = 'paid' AND created_at >= ?",
-            (today_start,)
-        ) as cur:
-            today_orders = (await cur.fetchone())[0]
 
-        yesterday_start = (now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)).isoformat()
-        async with db.execute(
-            "SELECT COALESCE(SUM(final_price), 0), COUNT(*) FROM orders WHERE status = 'paid' AND created_at >= ? AND created_at < ?",
-            (yesterday_start, today_start)
-        ) as cur:
-            yrow = await cur.fetchone()
-            yesterday_revenue, yesterday_orders = yrow[0], yrow[1]
-
-        async with db.execute(
-            "SELECT COUNT(*) FROM proxy_orders WHERE status = 'paid' AND created_at >= ?",
-            (today_start,)
-        ) as cur:
-            today_proxy = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT COALESCE(SUM(final_price), 0) FROM proxy_orders WHERE status = 'paid' AND created_at >= ?",
-            (today_start,)
-        ) as cur:
-            today_proxy_rev = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT COUNT(*) FROM proxy_orders WHERE status = 'pending'"
-        ) as cur:
-            pending_proxy = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT COUNT(*) FROM proxy_stock WHERE is_sold = 0"
-        ) as cur:
-            proxy_stock_total = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT COUNT(*) FROM proxy_stock WHERE is_sold = 1"
-        ) as cur:
-            proxy_sold_total = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM wallet_charges WHERE status IN ('paid','approved') AND created_at >= ?",
-            (today_start,)
-        ) as cur:
-            today_wallet = (await cur.fetchone())[0]
-
-    text = (
-        f"📊 <b>داشبورد روزانه / آمار</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 <b>امروز</b>\n"
-        f"   💵 فروش سرویس: <b>{today_revenue:,}</b> ت ({today_orders} سفارش)\n"
-        f"   🌐 فروش پروکسی: <b>{today_proxy_rev:,}</b> ت ({today_proxy} سفارش)\n"
-        f"   💳 شارژ کیف پول: <b>{today_wallet:,}</b> ت\n"
-        f"📆 <b>دیروز</b>\n"
-        f"   💵 فروش سرویس: <b>{yesterday_revenue:,}</b> ت ({yesterday_orders} سفارش)\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ سفارش سرویس در انتظار: <b>{pending_orders:,}</b>\n"
-        f"⏳ سفارش پروکسی در انتظار: <b>{pending_proxy:,}</b>\n"
-        f"💳 شارژ در انتظار: <b>{pending_charges:,}</b>\n"
-        f"🎫 تیکت باز: <b>{open_tickets:,}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 مجموع موجودی کیف پول‌ها: <b>{total_balance:,}</b> ت\n"
-        f"📦 پروکسی موجود انبار: <b>{proxy_stock_total:,}</b>\n"
-        f"✅ پروکسی فروخته‌شده کل: <b>{proxy_sold_total:,}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"👥 کاربران: <b>{total_users:,}</b> | 🚫 بن: <b>{banned_users:,}</b>\n"
-        f"📦 سفارشات پرداخت‌شده کل: <b>{paid_orders:,}</b>\n"
-        f"💵 درآمد کل سرویس: <b>{total_revenue:,}</b> ت\n"
-        f"📆 ۷ روز: <b>{week_revenue:,}</b> | ۳۰ روز: <b>{month_revenue:,}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 لاگ ادمین‌ها", callback_data="admin_logs")],
-            [back_button("admin_panel")],
-        ]),
-        parse_mode=ParseMode.HTML
-    )
+async def send_daily_finance_report(context: ContextTypes.DEFAULT_TYPE):
+    """جاب روزانه: ارسال گزارش مالی امروز به ادمین اصلی"""
+    try:
+        text = await build_finance_report("today")
+        text = "🌙 <b>گزارش مالی روزانه (خودکار)</b>\n" + text
+        await context.bot.send_message(
+            ADMIN_ID,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 گزارش کامل", callback_data="admin_stats")],
+                [InlineKeyboardButton("🛠 پنل مدیریت", callback_data="admin_panel")],
+            ]),
+        )
+        logger.info("Daily finance report sent to admin.")
+    except Exception as e:
+        logger.error(f"send_daily_finance_report: {e}")
 
 
 # ---------- بقیه توابع ادمین (از کد اصلی کپی شده و حفظ شده) ----------
@@ -7625,7 +7810,10 @@ async def redeem_gift_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⏳ زمان: {config['expire']}", callback_data="noop")],
         [InlineKeyboardButton(f"📊 حجم: {config['volume']}", callback_data="noop")],
-        [InlineKeyboardButton("📷 دریافت QR CODE", callback_data=f"qr_{order_id}")],
+        [
+            InlineKeyboardButton("📷 QR CODE", callback_data=f"qr_{order_id}"),
+            InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
+        ],
         [InlineKeyboardButton("📖 آموزش استفاده", callback_data=f"guide_{order_id}")],
         [back_button()],
     ])
@@ -9688,6 +9876,8 @@ def main():
 
     application.add_handler(CallbackQueryHandler(confirm_deduct_all, pattern="^confirm_deduct_all$"))
     application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^finance_"))
+    application.add_handler(CallbackQueryHandler(send_config_file, pattern="^dlcfg_"))
     application.add_handler(CallbackQueryHandler(admin_all_users, pattern="^admin_all_users"))
     application.add_handler(CallbackQueryHandler(admin_export_all_users, pattern="^admin_export_all_users$"))
     application.add_handler(CallbackQueryHandler(admin_user_orders, pattern="^admin_user_orders_"))
@@ -9750,6 +9940,16 @@ def main():
             app.job_queue.run_repeating(check_usage_and_expire, interval=3600, first=60)
             app.job_queue.run_repeating(cleanup_old_tests, interval=86400, first=120)
             app.job_queue.run_repeating(cleanup_expired_configs, interval=21600, first=300)  # هر ۶ ساعت
+            # گزارش مالی روزانه ساعت ۲۳:۵۵
+            try:
+                from datetime import time as dt_time
+                app.job_queue.run_daily(
+                    send_daily_finance_report,
+                    time=dt_time(hour=23, minute=55, second=0),
+                    name="daily_finance_report",
+                )
+            except Exception as e:
+                logger.error(f"schedule daily finance report: {e}")
             logger.info("Background jobs started.")
 
     application.post_init = post_init
