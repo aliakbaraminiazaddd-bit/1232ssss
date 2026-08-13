@@ -45,6 +45,7 @@ PANEL_PASSWORD = "12345678sina"
 MAX_PENDING_ORDERS = 2          # حداکثر سفارش در انتظار همزمان برای هر کاربر
 USAGE_WARNING_PERCENT = 85      # درصد هشدار مصرف
 EXPIRE_WARN_HOURS = 24          # چند ساعت قبل از انقضا هشدار بده
+AUTO_RENEW_HOURS = 24           # چند ساعت قبل از انقضا تمدید خودکار انجام شود
 TEST_DELETE_AFTER_HOURS = 48    # حذف خودکار اکانت تست بعد از چند ساعت
 
 # پروکسی — قیمت‌های پایه (قابل تغییر از پنل ادمین)
@@ -108,7 +109,14 @@ logger = logging.getLogger(__name__)
     ADMIN_REJECT_REASON,
     TRACK_ORDER_CODE,
     ADMIN_FAQ,
-) = range(60)
+    # کد هدیه
+    ADMIN_GIFT_CODE,
+    ADMIN_GIFT_VOLUME,
+    ADMIN_GIFT_DAYS,
+    ADMIN_GIFT_SERVER,
+    ADMIN_GIFT_MAX_USES,
+    WAITING_GIFT_CODE,
+) = range(66)
 
 # ==================== دیتابیس ====================
 async def init_db():
@@ -172,7 +180,8 @@ async def init_db():
                 warned_85 INTEGER DEFAULT 0,
                 expire_warned INTEGER DEFAULT 0,
                 panel_username TEXT,
-                tracking_code TEXT
+                tracking_code TEXT,
+                auto_renew INTEGER DEFAULT 0
             )
         """)
         # ستون‌های جدید برای دیتابیس‌های قدیمی
@@ -181,6 +190,7 @@ async def init_db():
             ("expire_warned", "INTEGER DEFAULT 0"),
             ("panel_username", "TEXT"),
             ("tracking_code", "TEXT"),
+            ("auto_renew", "INTEGER DEFAULT 0"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
@@ -195,6 +205,21 @@ async def init_db():
                 max_uses INTEGER,
                 used_count INTEGER DEFAULT 0,
                 is_active INTEGER DEFAULT 1
+            )
+        """)
+        # کدهای هدیه یک‌بارمصرف (حجم + روز مشخص)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS gift_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                volume_gb INTEGER NOT NULL,
+                days INTEGER NOT NULL,
+                server_type TEXT DEFAULT 'holland',
+                max_uses INTEGER DEFAULT 1,
+                used_count INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT,
+                created_by INTEGER
             )
         """)
         await db.execute("""
@@ -920,9 +945,12 @@ def main_keyboard(is_admin: bool = False):
         ],
         [
             InlineKeyboardButton("💰 کیف پول", callback_data="wallet"),
-            InlineKeyboardButton("💬 پشتیبانی", callback_data="support"),
+            InlineKeyboardButton("🎁 کد هدیه", callback_data="redeem_gift"),
         ],
-        [InlineKeyboardButton("❓ راهنما / سوالات متداول", callback_data="faq")],
+        [
+            InlineKeyboardButton("💬 پشتیبانی", callback_data="support"),
+            InlineKeyboardButton("❓ راهنما / سوالات متداول", callback_data="faq"),
+        ],
         [
             InlineKeyboardButton("👥 دعوت از دوستان", callback_data="referral"),
             InlineKeyboardButton("📜 قوانین", callback_data="rules"),
@@ -1283,21 +1311,135 @@ def generate_tracking_code(length: int = 10) -> str:
 
 
 # ==================== جاب‌های پس‌زمینه ====================
+async def _do_auto_renew(bot, order_id: int, user_id: int, username: str, vol: int, server_type: str) -> bool:
+    """
+    تلاش برای تمدید خودکار یک سرویس از کیف پول.
+    True = موفق | False = ناموفق (موجودی کم یا خطا)
+    """
+    try:
+        # قیمت تمدید از تعرفه
+        async with aiosqlite.connect("bot.db") as db:
+            async with db.execute(
+                "SELECT price FROM tariffs WHERE server_type = ? AND volume_gb = ? AND is_active = 1 LIMIT 1",
+                (server_type, vol)
+            ) as cur:
+                price_row = await cur.fetchone()
+            price = price_row[0] if price_row else 0
+            if price <= 0:
+                # برای custom یا نامحدود از price_per_day تقریبی
+                if server_type == "unlimited":
+                    price = 0  # نامحدود معمولاً ماهانه است؛ اگر تعرفه نبود رد کن
+                else:
+                    logger.warning(f"auto_renew: no tariff for order #{order_id}")
+                    return False
+
+            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cur:
+                bal_row = await cur.fetchone()
+            balance = bal_row[0] if bal_row else 0
+
+            if balance < price:
+                # موجودی کافی نیست — اطلاع به کاربر
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"⚠️ <b>تمدید خودکار ناموفق</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"سرویس <code>{username}</code> نزدیک انقضاست و تمدید خودکار روشن است،\n"
+                        f"اما موجودی کیف پول کافی نیست.\n\n"
+                        f"💰 قیمت تمدید: <b>{price:,}</b> تومان\n"
+                        f"💳 موجودی شما: <b>{balance:,}</b> تومان\n\n"
+                        f"لطفاً کیف پول را شارژ کنید یا دستی تمدید کنید.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("💰 شارژ کیف پول", callback_data="wallet")],
+                            [InlineKeyboardButton("🔄 تمدید دستی", callback_data=f"renew_{order_id}")],
+                        ])
+                    )
+                except Exception:
+                    pass
+                return False
+
+            # کسر موجودی
+            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
+            await db.commit()
+
+        # تمدید در پنل
+        user_data = await get_user_from_panel(username, server_type=server_type)
+        if not user_data:
+            # برگرداندن موجودی
+            async with aiosqlite.connect("bot.db") as db:
+                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (price, user_id))
+                await db.commit()
+            return False
+
+        current_expire = user_data.get("expire") or 0
+        current_limit = user_data.get("data_limit") or 0
+        service_days = await get_int_setting("service_days", 30)
+        add_bytes = vol * 1024 * 1024 * 1024 if server_type != "unlimited" else 0
+        new_limit = (current_limit or 0) + add_bytes if server_type != "unlimited" else 0
+        now_ts = int(datetime.now().timestamp())
+        base_expire = max(current_expire or 0, now_ts)
+        if server_type == "unlimited":
+            # برای نامحدود معمولاً volume_gb = ماه
+            new_expire = base_expire + (vol * 30 * 86400)
+        else:
+            new_expire = base_expire + (service_days * 86400)
+
+        payload = {"expire": new_expire, "status": "active"}
+        if server_type != "unlimited":
+            payload["data_limit"] = new_limit
+        await modify_user_in_panel(username, payload, server_type=server_type)
+
+        # ثبت سفارش تمدید + ریست فلگ‌ها
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute(
+                """INSERT INTO orders (user_id, server_type, volume_gb, price, final_price,
+                   config_name, status, created_at, panel_username, config_data)
+                   VALUES (?, ?, ?, ?, ?, ?, 'paid', ?, ?, ?)""",
+                (user_id, server_type, vol, price, price, username,
+                 datetime.now().isoformat(), username,
+                 json.dumps({"renewed_from": order_id, "type": "auto_renew"}))
+            )
+            await db.execute(
+                "UPDATE orders SET warned_85 = 0, expire_warned = 0 WHERE id = ?", (order_id,)
+            )
+            await db.commit()
+
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ <b>تمدید خودکار موفق</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"سرویس <code>{username}</code> به‌صورت خودکار تمدید شد.\n\n"
+                f"📊 حجم اضافه: <b>{vol}</b> گیگ\n"
+                f"⏳ اعتبار اضافه: <b>{service_days if server_type != 'unlimited' else vol * 30}</b> روز\n"
+                f"💰 مبلغ کسرشده: <b>{price:,}</b> تومان\n"
+                f"💳 موجودی جدید: <b>{balance - price:,}</b> تومان",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        logger.info(f"Auto-renew OK order=#{order_id} user={user_id} price={price}")
+        return True
+    except Exception as e:
+        logger.error(f"_do_auto_renew error order={order_id}: {e}")
+        return False
+
+
 async def check_usage_and_expire(context: ContextTypes.DEFAULT_TYPE):
-    """هر ساعت: هشدار ۸۵٪ مصرف + هشدار انقضا"""
+    """هر ساعت: هشدار ۸۵٪ مصرف + هشدار انقضا + تمدید خودکار"""
     try:
         async with aiosqlite.connect("bot.db") as db:
             async with db.execute(
                 """SELECT id, user_id, config_name, panel_username, volume_gb, config_data,
-                          warned_85, expire_warned, server_type
+                          warned_85, expire_warned, server_type, auto_renew
                    FROM orders WHERE status = 'paid' AND (config_name IS NOT NULL OR panel_username IS NOT NULL)"""
             ) as cur:
                 orders = await cur.fetchall()
 
-        for order_id, user_id, conf_name, panel_username, vol, conf_data, warned_85, expire_warned, server_type in orders:
+        for order_id, user_id, conf_name, panel_username, vol, conf_data, warned_85, expire_warned, server_type, auto_renew in orders:
             lookup_name = (panel_username or conf_name or "").strip()
             if not lookup_name:
-                # از config_data سعی کن
                 if conf_data:
                     try:
                         lookup_name = json.loads(conf_data).get("username") or ""
@@ -1313,7 +1455,6 @@ async def check_usage_and_expire(context: ContextTypes.DEFAULT_TYPE):
                 used = user_info.get("used_traffic") or 0
                 limit = user_info.get("data_limit") or 0
                 expire_ts = user_info.get("expire") or 0
-                status = user_info.get("status", "")
 
                 # هشدار ۸۵٪
                 if limit > 0 and not warned_85:
@@ -1339,7 +1480,32 @@ async def check_usage_and_expire(context: ContextTypes.DEFAULT_TYPE):
                         except Exception as e:
                             logger.error(f"send 85% warn error: {e}")
 
-                # هشدار انقضا
+                # تمدید خودکار (قبل از هشدار انقضا)
+                if expire_ts and (auto_renew or 0):
+                    now_ts = int(datetime.now().timestamp())
+                    hours_left = (expire_ts - now_ts) / 3600
+                    if 0 < hours_left <= AUTO_RENEW_HOURS:
+                        # جلوگیری از تمدید چندباره: اگر اخیراً auto_renew ثبت شده باشد رد کن
+                        async with aiosqlite.connect("bot.db") as db:
+                            cutoff = (datetime.now() - timedelta(hours=AUTO_RENEW_HOURS + 1)).isoformat()
+                            async with db.execute(
+                                """SELECT 1 FROM orders
+                                   WHERE user_id = ? AND panel_username = ?
+                                     AND status = 'paid'
+                                     AND config_data LIKE '%"type": "auto_renew"%'
+                                     AND created_at >= ?
+                                   LIMIT 1""",
+                                (user_id, lookup_name, cutoff)
+                            ) as cur:
+                                already = await cur.fetchone()
+                        if not already:
+                            await _do_auto_renew(
+                                context.bot, order_id, user_id, lookup_name, vol, server_type
+                            )
+                            # بعد از تمدید موفق، فلگ‌ها ریست می‌شوند؛ ادامه نده
+                            continue
+
+                # هشدار انقضا (فقط اگر auto_renew خاموش باشد یا تمدید نشد)
                 if expire_ts and not expire_warned:
                     now_ts = int(datetime.now().timestamp())
                     hours_left = (expire_ts - now_ts) / 3600
@@ -3789,7 +3955,7 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect("bot.db") as db:
         async with db.execute(
             """SELECT server_type, volume_gb, final_price, status, config_name, config_data,
-                      created_at, panel_username, tracking_code
+                      created_at, panel_username, tracking_code, auto_renew
                FROM orders WHERE id = ? AND user_id = ?""",
             (order_id, query.from_user.id)
         ) as cur:
@@ -3799,7 +3965,8 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("سفارش یافت نشد", show_alert=True)
         return
 
-    server, vol, price, status, name, conf_data, created, panel_username, tracking_code = row
+    server, vol, price, status, name, conf_data, created, panel_username, tracking_code, auto_renew = row
+    auto_renew = auto_renew or 0
     if server == "holland":
         server_name = "🇳🇱 هلند"
         plan_text = f"{vol} گیگ"
@@ -3826,6 +3993,9 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if tracking_code:
         text += f"\n🔖 کد رهگیری: <code>{tracking_code}</code>"
+    if status == "paid":
+        ar_text = "🟢 فعال" if auto_renew else "🔴 غیرفعال"
+        text += f"\n🔄 تمدید خودکار: <b>{ar_text}</b>"
 
     # نمایش مصرف واقعی از پنل
     if status == "paid":
@@ -3882,11 +4052,41 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb.insert(0, [InlineKeyboardButton("📷 QR Code", callback_data=f"qr_{order_id}")])
             kb.insert(1, [InlineKeyboardButton("📖 آموزش", callback_data=f"guide_{order_id}")])
             kb.insert(2, [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")])
-            kb.insert(3, [InlineKeyboardButton("🔀 انتقال سرویس", callback_data=f"transfer_{order_id}")])
+            toggle_label = "🔴 خاموش کردن تمدید خودکار" if auto_renew else "🟢 روشن کردن تمدید خودکار"
+            kb.insert(3, [InlineKeyboardButton(toggle_label, callback_data=f"toggle_auto_renew_{order_id}")])
+            kb.insert(4, [InlineKeyboardButton("🔀 انتقال سرویس", callback_data=f"transfer_{order_id}")])
         except Exception:
             pass
 
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+
+async def toggle_auto_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """روشن/خاموش کردن تمدید خودکار برای یک سرویس"""
+    query = update.callback_query
+    await query.answer()
+    order_id = int(query.data.split("_")[-1])
+    user_id = query.from_user.id
+
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute(
+            "SELECT auto_renew, status FROM orders WHERE id = ? AND user_id = ?",
+            (order_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row or row[1] != "paid":
+            await query.answer("سفارش معتبر نیست", show_alert=True)
+            return
+        new_val = 0 if (row[0] or 0) else 1
+        await db.execute("UPDATE orders SET auto_renew = ? WHERE id = ?", (new_val, order_id))
+        await db.commit()
+
+    if new_val:
+        await query.answer("✅ تمدید خودکار فعال شد. قبل از انقضا از کیف پول تمدید می‌شود.", show_alert=True)
+    else:
+        await query.answer("🔴 تمدید خودکار غیرفعال شد.", show_alert=True)
+    # رفرش صفحه جزئیات
+    return await order_detail(update, context)
 
 
 # ---------- انتقال سرویس ----------
@@ -5241,7 +5441,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🌐 تعرفه مولتی", callback_data="admin_tariff_multi"),
             InlineKeyboardButton("💎 تعرفه نامحدود", callback_data="admin_tariff_unlimited")
         ])
-        buttons.append([InlineKeyboardButton("🎟 کد تخفیف", callback_data="admin_discounts")])
+        buttons.append([
+            InlineKeyboardButton("🎟 کد تخفیف", callback_data="admin_discounts"),
+            InlineKeyboardButton("🎁 کد هدیه", callback_data="admin_gift_codes"),
+        ])
         buttons.append([
             InlineKeyboardButton("💰 افزایش موجودی", callback_data="admin_add_balance"),
             InlineKeyboardButton("💰 افزایش همه", callback_data="admin_all_balance")
@@ -6899,6 +7102,326 @@ async def del_disc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("حذف شد", show_alert=True)
     await admin_discounts(update, context)
 
+
+# ---------- کد هدیه یک‌بارمصرف ----------
+async def admin_gift_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute(
+            """SELECT id, code, volume_gb, days, server_type, max_uses, used_count, is_active
+               FROM gift_codes ORDER BY id DESC LIMIT 30"""
+        ) as cur:
+            rows = await cur.fetchall()
+
+    buttons = []
+    if not rows:
+        text = (
+            "🎁 <b>کدهای هدیه</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "هیچ کد هدیه‌ای وجود ندارد.\n"
+            "با دکمه زیر کد جدید بسازید."
+        )
+    else:
+        text = "🎁 <b>کدهای هدیه</b>\n━━━━━━━━━━━━━━━━━━\n"
+        for gid, code, vol, days, stype, maxu, used, active in rows:
+            status = "✅" if active else "❌"
+            limit = "∞" if maxu == 0 else f"{used}/{maxu}"
+            sname = {"holland": "هلند", "multi": "مولتی", "unlimited": "نامحدود"}.get(stype, stype)
+            text += f"{status} <code>{code}</code> | {vol}G / {days}روز | {sname} | {limit}\n"
+            buttons.append([
+                InlineKeyboardButton(f"{status} {code}", callback_data=f"toggle_gift_{gid}"),
+                InlineKeyboardButton("🗑", callback_data=f"del_gift_{gid}")
+            ])
+        text += "\nروی کد بزنید تا فعال/غیرفعال شود."
+
+    buttons.append([InlineKeyboardButton("➕ ساخت کد هدیه جدید", callback_data="admin_new_gift")])
+    buttons.append([back_button("admin_panel")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+
+
+async def admin_new_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    await query.edit_message_text(
+        "🎁 <b>ساخت کد هدیه</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "کد هدیه را وارد کنید (حروف انگلیسی و عدد، بدون فاصله):\n"
+        "مثال: <code>GIFT2026</code> یا <code>VIP1G30D</code>",
+        parse_mode=ParseMode.HTML
+    )
+    return ADMIN_GIFT_CODE
+
+
+async def admin_gift_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip().upper()
+    if not code.isalnum() or len(code) < 3 or len(code) > 32:
+        await update.message.reply_text(
+            "❌ کد باید فقط حروف و عدد انگلیسی باشد (۳ تا ۳۲ کاراکتر). دوباره وارد کنید:"
+        )
+        return ADMIN_GIFT_CODE
+    context.user_data["gift_code"] = code
+    await update.message.reply_text(
+        f"✅ کد: <code>{code}</code>\n\n"
+        f"📦 حجم را به گیگابایت وارد کنید (مثال: 5 یا 10):",
+        parse_mode=ParseMode.HTML
+    )
+    return ADMIN_GIFT_VOLUME
+
+
+async def admin_gift_volume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        vol = int(update.message.text.strip().replace(",", ""))
+        if vol <= 0:
+            raise ValueError
+    except:
+        await update.message.reply_text("❌ عدد معتبر و بزرگ‌تر از صفر وارد کنید:")
+        return ADMIN_GIFT_VOLUME
+    context.user_data["gift_volume"] = vol
+    await update.message.reply_text(
+        f"✅ حجم: <b>{vol}</b> گیگ\n\n"
+        f"⏱ تعداد روز اعتبار را وارد کنید (مثال: 30):",
+        parse_mode=ParseMode.HTML
+    )
+    return ADMIN_GIFT_DAYS
+
+
+async def admin_gift_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        days = int(update.message.text.strip().replace(",", ""))
+        if days <= 0:
+            raise ValueError
+    except:
+        await update.message.reply_text("❌ عدد معتبر و بزرگ‌تر از صفر وارد کنید:")
+        return ADMIN_GIFT_DAYS
+    context.user_data["gift_days"] = days
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇳🇱 هلند", callback_data="gift_server_holland")],
+        [InlineKeyboardButton("🌐 مولتی", callback_data="gift_server_multi")],
+        [InlineKeyboardButton("💎 نامحدود", callback_data="gift_server_unlimited")],
+        [back_button("admin_gift_codes")],
+    ])
+    await update.message.reply_text(
+        f"✅ روز: <b>{days}</b>\n\n"
+        f"🖥 نوع سرور را انتخاب کنید:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb
+    )
+    return ADMIN_GIFT_SERVER
+
+
+async def admin_gift_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    server = query.data.replace("gift_server_", "")
+    if server not in ("holland", "multi", "unlimited"):
+        server = "holland"
+    context.user_data["gift_server"] = server
+    await query.edit_message_text(
+        f"✅ سرور: <b>{server}</b>\n\n"
+        f"🔢 حداکثر تعداد استفاده از این کد را وارد کنید:\n"
+        f"(برای یک‌بارمصرف عدد <b>۱</b> را بفرستید — برای نامحدود <b>۰</b>)",
+        parse_mode=ParseMode.HTML
+    )
+    return ADMIN_GIFT_MAX_USES
+
+
+async def admin_gift_max_uses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        max_uses = int(update.message.text.strip())
+        if max_uses < 0:
+            raise ValueError
+    except:
+        await update.message.reply_text("❌ عدد معتبر وارد کنید (۰ = نامحدود):")
+        return ADMIN_GIFT_MAX_USES
+
+    code = context.user_data.get("gift_code")
+    vol = context.user_data.get("gift_volume")
+    days = context.user_data.get("gift_days")
+    server = context.user_data.get("gift_server", "holland")
+    if not all([code, vol, days]):
+        await update.message.reply_text("❌ اطلاعات ناقص. دوباره از ابتدا شروع کنید.", reply_markup=main_keyboard(True))
+        return ConversationHandler.END
+
+    async with aiosqlite.connect("bot.db") as db:
+        try:
+            await db.execute(
+                """INSERT INTO gift_codes (code, volume_gb, days, server_type, max_uses, created_at, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (code, vol, days, server, max_uses, datetime.now().isoformat(), update.effective_user.id)
+            )
+            await db.commit()
+        except Exception:
+            await update.message.reply_text(
+                "❌ این کد قبلاً وجود دارد. کد دیگری انتخاب کنید.",
+                reply_markup=main_keyboard(True)
+            )
+            return ConversationHandler.END
+
+    sname = {"holland": "هلند", "multi": "مولتی", "unlimited": "نامحدود"}.get(server, server)
+    limit_txt = "نامحدود" if max_uses == 0 else str(max_uses)
+    await update.message.reply_text(
+        f"✅ <b>کد هدیه ساخته شد</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎁 کد: <code>{code}</code>\n"
+        f"📦 حجم: <b>{vol}</b> گیگ\n"
+        f"⏱ روز: <b>{days}</b>\n"
+        f"🖥 سرور: {sname}\n"
+        f"🔢 ظرفیت: {limit_txt}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(True)
+    )
+    for k in ("gift_code", "gift_volume", "gift_days", "gift_server"):
+        context.user_data.pop(k, None)
+    return ConversationHandler.END
+
+
+async def toggle_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    gid = int(query.data.split("_")[-1])
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT is_active FROM gift_codes WHERE id = ?", (gid,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await query.answer("یافت نشد", show_alert=True)
+            return
+        new = 0 if row[0] else 1
+        await db.execute("UPDATE gift_codes SET is_active = ? WHERE id = ?", (new, gid))
+        await db.commit()
+    await query.answer("✅ فعال شد" if new else "❌ غیرفعال شد", show_alert=True)
+    await admin_gift_codes(update, context)
+
+
+async def del_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    gid = int(query.data.split("_")[-1])
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("DELETE FROM gift_codes WHERE id = ?", (gid,))
+        await db.commit()
+    await query.answer("🗑 حذف شد", show_alert=True)
+    await admin_gift_codes(update, context)
+
+
+async def redeem_gift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """شروع استفاده از کد هدیه توسط کاربر"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if await is_banned(user.id):
+        await query.edit_message_text("🚫 شما از استفاده از این ربات محروم شده‌اید.")
+        return
+    if await is_maintenance() and not await is_admin(user.id):
+        await query.edit_message_text("🔧 ربات در حالت تعمیرات است.")
+        return
+    await query.edit_message_text(
+        "🎁 <b>استفاده از کد هدیه</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "کد هدیه خود را وارد کنید:\n"
+        "مثال: <code>GIFT2026</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[back_button()]])
+    )
+    return WAITING_GIFT_CODE
+
+
+async def redeem_gift_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دریافت و اعمال کد هدیه"""
+    user = update.effective_user
+    code = update.message.text.strip().upper()
+
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute(
+            """SELECT id, volume_gb, days, server_type, max_uses, used_count, is_active
+               FROM gift_codes WHERE code = ?""",
+            (code,)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row or not row[6]:
+        await update.message.reply_text(
+            "❌ کد هدیه معتبر نیست یا غیرفعال است.\nدوباره تلاش کنید یا /start بزنید."
+        )
+        return WAITING_GIFT_CODE
+
+    gid, vol, days, server, max_uses, used, _ = row
+    if max_uses > 0 and used >= max_uses:
+        await update.message.reply_text(
+            "❌ ظرفیت استفاده از این کد به پایان رسیده است.",
+            reply_markup=main_keyboard(await is_admin(user.id))
+        )
+        return ConversationHandler.END
+
+    # ساخت کانفیگ رایگان
+    gift_name = "gift_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    is_unlim = (server == "unlimited")
+    try:
+        config = await create_config_from_panel(
+            gift_name, vol, days=days, is_unlimited=is_unlim, server_type=server
+        )
+    except Exception as e:
+        logger.error(f"redeem_gift create error: {e}")
+        await update.message.reply_text(
+            f"❌ خطا در ساخت سرویس هدیه.\nلطفاً بعداً تلاش کنید یا با پشتیبانی تماس بگیرید.",
+            reply_markup=main_keyboard(await is_admin(user.id))
+        )
+        return ConversationHandler.END
+
+    tracking = generate_tracking_code()
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute(
+            """INSERT INTO orders (user_id, server_type, volume_gb, price, final_price,
+               config_name, status, created_at, panel_username, config_data, tracking_code)
+               VALUES (?, ?, ?, 0, 0, ?, 'paid', ?, ?, ?, ?)""",
+            (
+                user.id, server, vol, config["username"],
+                datetime.now().isoformat(), config["username"],
+                json.dumps({**config, "type": "gift_code", "gift_code": code}),
+                tracking,
+            )
+        )
+        order_id = cur.lastrowid
+        await db.execute(
+            "UPDATE gift_codes SET used_count = used_count + 1 WHERE id = ?", (gid,)
+        )
+        await db.commit()
+
+    qr = generate_qr(config["subscription_url"])
+    sname = {"holland": "هلند", "multi": "مولتی", "unlimited": "نامحدود"}.get(server, server)
+    caption = (
+        f"🎁 <b>کد هدیه با موفقیت اعمال شد!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"کد: <code>{code}</code>\n"
+        f"📦 {sname} — {vol} گیگ / {days} روز\n\n"
+        f"👤 نام کاربری: <code>{config['username']}</code>\n"
+        f"🔗 لینک اشتراک:\n<code>{config['subscription_url']}</code>\n\n"
+        f"🔖 کد رهگیری: <code>{tracking}</code>\n"
+        f"📦 سفارش: #{order_id}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⏳ زمان: {config['expire']}", callback_data="noop")],
+        [InlineKeyboardButton(f"📊 حجم: {config['volume']}", callback_data="noop")],
+        [InlineKeyboardButton("📷 دریافت QR CODE", callback_data=f"qr_{order_id}")],
+        [InlineKeyboardButton("📖 آموزش استفاده", callback_data=f"guide_{order_id}")],
+        [back_button()],
+    ])
+    await update.message.reply_photo(
+        photo=InputFile(qr, "qr.png"),
+        caption=caption,
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+    return ConversationHandler.END
 
 
 async def admin_warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8757,6 +9280,8 @@ def main():
             CallbackQueryHandler(order_history, pattern="^order_history$"),
             CallbackQueryHandler(quick_renew, pattern="^quick_renew$"),
             CallbackQueryHandler(admin_new_discount, pattern="^admin_new_discount$"),
+            CallbackQueryHandler(admin_new_gift, pattern="^admin_new_gift$"),
+            CallbackQueryHandler(redeem_gift_start, pattern="^redeem_gift$"),
             CallbackQueryHandler(admin_ban, pattern="^admin_ban$"),
             CallbackQueryHandler(admin_unban, pattern="^admin_unban$"),
             CallbackQueryHandler(admin_warn_user, pattern="^admin_warn_user$"),
@@ -8871,6 +9396,13 @@ def main():
                 CallbackQueryHandler(reject_order_no_note, pattern="^reject_no_note"),
                 CallbackQueryHandler(reject_order_preset, pattern="^reject_preset_"),
             ],
+            # کد هدیه
+            ADMIN_GIFT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_code)],
+            ADMIN_GIFT_VOLUME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_volume)],
+            ADMIN_GIFT_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_days)],
+            ADMIN_GIFT_SERVER: [CallbackQueryHandler(admin_gift_server, pattern="^gift_server_")],
+            ADMIN_GIFT_MAX_USES: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_max_uses)],
+            WAITING_GIFT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_gift_code)],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -8886,6 +9418,7 @@ def main():
             CallbackQueryHandler(admin_panel, pattern="^admin_panel$"),
             CallbackQueryHandler(proxy_menu, pattern="^proxy_menu$"),
             CallbackQueryHandler(wallet, pattern="^wallet$"),
+            CallbackQueryHandler(redeem_gift_start, pattern="^redeem_gift$"),
             CallbackQueryHandler(test_account, pattern="^test_account$"),
             CallbackQueryHandler(support, pattern="^support$"),
             CallbackQueryHandler(referral, pattern="^referral$"),
@@ -8918,6 +9451,11 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_discounts, pattern="^admin_discounts$"))
     application.add_handler(CallbackQueryHandler(toggle_disc, pattern="^toggle_disc_"))
     application.add_handler(CallbackQueryHandler(del_disc, pattern="^del_disc_"))
+    application.add_handler(CallbackQueryHandler(admin_gift_codes, pattern="^admin_gift_codes$"))
+    application.add_handler(CallbackQueryHandler(toggle_gift, pattern="^toggle_gift_"))
+    application.add_handler(CallbackQueryHandler(del_gift, pattern="^del_gift_"))
+    application.add_handler(CallbackQueryHandler(toggle_auto_renew, pattern="^toggle_auto_renew_"))
+    application.add_handler(CallbackQueryHandler(redeem_gift_start, pattern="^redeem_gift$"))
     application.add_handler(CallbackQueryHandler(approve_order, pattern="^approve_order_"))
     # reject_order از طریق ConversationHandler + هندلرهای سراسری (دکمه‌های دلیل)
     application.add_handler(CallbackQueryHandler(reject_order_preset, pattern="^reject_preset_"))
