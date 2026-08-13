@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
     WAITING_WALLET_AMOUNT, WAITING_WALLET_RECEIPT,
     ADMIN_ADD_TARIFF_GB, ADMIN_ADD_TARIFF_PRICE,
     ADMIN_WELCOME, ADMIN_RULES, ADMIN_DISCOUNT_CODE,
-    ADMIN_DISCOUNT_PERCENT, ADMIN_DISCOUNT_LIMIT,
+    ADMIN_DISCOUNT_PERCENT, ADMIN_DISCOUNT_LIMIT, ADMIN_DISCOUNT_EXPIRE,
     ADMIN_BAN, ADMIN_UNBAN, ADMIN_BROADCAST,
     ADMIN_MSG_USER_ID, ADMIN_MSG_TEXT,
     ADMIN_TEST_RECHARGE, ADMIN_ADD_BALANCE_ID,
@@ -116,7 +116,7 @@ logger = logging.getLogger(__name__)
     ADMIN_GIFT_SERVER,
     ADMIN_GIFT_MAX_USES,
     WAITING_GIFT_CODE,
-) = range(66)
+) = range(67)
 
 # ==================== دیتابیس ====================
 async def init_db():
@@ -204,9 +204,21 @@ async def init_db():
                 percent INTEGER,
                 max_uses INTEGER,
                 used_count INTEGER DEFAULT 0,
-                is_active INTEGER DEFAULT 1
+                is_active INTEGER DEFAULT 1,
+                expires_at TEXT,
+                starts_at TEXT,
+                created_at TEXT
             )
         """)
+        for col, typ in [
+            ("expires_at", "TEXT"),
+            ("starts_at", "TEXT"),
+            ("created_at", "TEXT"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE discount_codes ADD COLUMN {col} {typ}")
+            except:
+                pass
         # کدهای هدیه یک‌بارمصرف (حجم + روز مشخص)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS gift_codes (
@@ -1427,8 +1439,21 @@ async def _do_auto_renew(bot, order_id: int, user_id: int, username: str, vol: i
 
 
 async def check_usage_and_expire(context: ContextTypes.DEFAULT_TYPE):
-    """هر ساعت: هشدار ۸۵٪ مصرف + هشدار انقضا + تمدید خودکار"""
+    """هر ساعت: هشدار ۸۵٪ مصرف + هشدار انقضا + تمدید خودکار + غیرفعال‌سازی کدهای منقضی"""
     try:
+        # غیرفعال کردن خودکار کدهای تخفیف منقضی‌شده
+        try:
+            now_iso = datetime.now().isoformat()
+            async with aiosqlite.connect("bot.db") as db:
+                await db.execute(
+                    """UPDATE discount_codes SET is_active = 0
+                       WHERE is_active = 1 AND expires_at IS NOT NULL AND expires_at < ?""",
+                    (now_iso,)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.error(f"deactivate expired discounts: {e}")
+
         async with aiosqlite.connect("bot.db") as db:
             async with db.execute(
                 """SELECT id, user_id, config_name, panel_username, volume_gb, config_data,
@@ -2208,7 +2233,8 @@ async def receive_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = update.message.text.strip().upper()
         async with aiosqlite.connect("bot.db") as db:
             async with db.execute(
-                "SELECT percent, max_uses, used_count, is_active FROM discount_codes WHERE code = ?",
+                """SELECT percent, max_uses, used_count, is_active, expires_at, starts_at
+                   FROM discount_codes WHERE code = ?""",
                 (code,)
             ) as cur:
                 row = await cur.fetchone()
@@ -2217,7 +2243,34 @@ async def receive_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ کد تخفیف معتبر نیست یا غیرفعال است.")
             return WAITING_DISCOUNT
 
-        percent, max_uses, used = row[0], row[1], row[2]
+        percent, max_uses, used, _, expires_at, starts_at = row
+        now = datetime.now()
+
+        # بررسی شروع کمپین
+        if starts_at:
+            try:
+                start_dt = datetime.fromisoformat(starts_at)
+                if now < start_dt:
+                    await update.message.reply_text(
+                        f"❌ این کد هنوز فعال نشده است.\n"
+                        f"🕐 شروع: {start_dt.strftime('%Y-%m-%d %H:%M')}"
+                    )
+                    return WAITING_DISCOUNT
+            except Exception:
+                pass
+
+        # بررسی انقضا
+        if expires_at:
+            try:
+                exp_dt = datetime.fromisoformat(expires_at)
+                if now > exp_dt:
+                    await update.message.reply_text(
+                        "❌ مهلت استفاده از این کد تخفیف به پایان رسیده است."
+                    )
+                    return WAITING_DISCOUNT
+            except Exception:
+                pass
+
         if max_uses > 0 and used >= max_uses:
             await update.message.reply_text("❌ ظرفیت استفاده از این کد به پایان رسیده است.")
             return WAITING_DISCOUNT
@@ -2237,7 +2290,6 @@ async def receive_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if days and context.user_data.get("server_type") in ("holland", "multi", "custom"):
             price_per_day = await get_int_setting("price_per_day", 1000)
             if context.user_data.get("server_type") == "custom":
-                # در پلن دلخواه قیمت از قبل کامل محاسبه شده
                 total_before = context.user_data.get("final_price", base)
             else:
                 total_before = base + (days * price_per_day)
@@ -2249,7 +2301,27 @@ async def receive_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["final_price"] = final
         context.user_data["discount_percent"] = percent
 
-        await update.message.reply_text(f"✅ کد تخفیف <code>{code}</code> با <b>{percent}٪</b> اعمال شد.", parse_mode=ParseMode.HTML)
+        expire_note = ""
+        if expires_at:
+            try:
+                exp_dt = datetime.fromisoformat(expires_at)
+                remain = exp_dt - now
+                if remain.total_seconds() > 0:
+                    hours_left = int(remain.total_seconds() // 3600)
+                    mins_left = int((remain.total_seconds() % 3600) // 60)
+                    if hours_left >= 24:
+                        expire_note = f"\n⏰ اعتبار باقی‌مانده: حدود <b>{hours_left // 24}</b> روز"
+                    elif hours_left > 0:
+                        expire_note = f"\n⏰ اعتبار باقی‌مانده: <b>{hours_left}</b> ساعت و {mins_left} دقیقه"
+                    else:
+                        expire_note = f"\n⏰ اعتبار باقی‌مانده: کمتر از ۱ ساعت"
+            except Exception:
+                pass
+
+        await update.message.reply_text(
+            f"✅ کد تخفیف <code>{code}</code> با <b>{percent}٪</b> اعمال شد.{expire_note}",
+            parse_mode=ParseMode.HTML
+        )
         return await show_invoice(update, context)
     except Exception as e:
         logger.error(f"receive_discount error: {e}")
@@ -7008,37 +7080,65 @@ async def admin_discounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     async with aiosqlite.connect("bot.db") as db:
-        async with db.execute("SELECT id, code, percent, max_uses, used_count, is_active FROM discount_codes") as cur:
+        async with db.execute(
+            """SELECT id, code, percent, max_uses, used_count, is_active, expires_at
+               FROM discount_codes ORDER BY id DESC"""
+        ) as cur:
             rows = await cur.fetchall()
 
     buttons = []
+    now = datetime.now()
     if not rows:
-        text = "🎟 کدهای تخفیف\n\nهیچ کدی وجود ندارد."
+        text = "🎟 <b>کدهای تخفیف / کمپین</b>\n\nهیچ کدی وجود ندارد."
     else:
-        text = "🎟 کدهای تخفیف\nروی هر کد بزنید تا فعال/غیرفعال شود، یا با 🗑 حذفش کنید."
-        for did, code, percent, maxu, used, active in rows:
+        text = "🎟 <b>کدهای تخفیف / کمپین</b>\nروی هر کد بزنید تا فعال/غیرفعال شود، یا با 🗑 حذفش کنید.\n"
+        for did, code, percent, maxu, used, active, expires_at in rows:
             status = "✅" if active else "❌"
             limit = "∞" if maxu == 0 else f"{used}/{maxu}"
+            exp_label = ""
+            if expires_at:
+                try:
+                    exp_dt = datetime.fromisoformat(expires_at)
+                    if now > exp_dt:
+                        exp_label = " | ⏰ منقضی"
+                        status = "⌛"
+                    else:
+                        remain_h = int((exp_dt - now).total_seconds() // 3600)
+                        if remain_h >= 24:
+                            exp_label = f" | ⏳ {remain_h // 24}د"
+                        else:
+                            exp_label = f" | ⏳ {remain_h}س"
+                except Exception:
+                    exp_label = " | ⏳"
+            else:
+                exp_label = " | ∞"
             buttons.append([
-                InlineKeyboardButton(f"{status} {code} | {percent}% | {limit}", callback_data=f"toggle_disc_{did}"),
+                InlineKeyboardButton(
+                    f"{status} {code} | {percent}% | {limit}{exp_label}",
+                    callback_data=f"toggle_disc_{did}"
+                ),
                 InlineKeyboardButton("🗑", callback_data=f"del_disc_{did}")
             ])
-    buttons.append([InlineKeyboardButton("➕ ساخت کد تخفیف جدید", callback_data="admin_new_discount")])
+    buttons.append([InlineKeyboardButton("➕ ساخت کد تخفیف / کمپین", callback_data="admin_new_discount")])
     buttons.append([back_button("admin_panel")])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
 
 async def admin_new_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "کد تخفیف را وارد کنید (فقط حروف انگلیسی و عدد، بدون فاصله - مثال: L4TSHoP123):"
+        "🎟 <b>ساخت کد تخفیف / کمپین</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "کد را وارد کنید (فقط حروف انگلیسی و عدد، بدون فاصله):\n"
+        "مثال: <code>SALE48H</code> یا <code>VIP20</code>",
+        parse_mode=ParseMode.HTML
     )
     return ADMIN_DISCOUNT_CODE
 
 async def admin_discount_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip().upper()
-    if not code.isalnum():
-        await update.message.reply_text("فقط حروف و عدد انگلیسی مجاز است.")
+    if not code.isalnum() or len(code) < 2:
+        await update.message.reply_text("فقط حروف و عدد انگلیسی مجاز است (حداقل ۲ کاراکتر).")
         return ADMIN_DISCOUNT_CODE
     context.user_data["new_disc_code"] = code
     await update.message.reply_text("چند درصد تخفیف بده؟ (عدد از ۱ تا ۱۰۰)")
@@ -7053,31 +7153,145 @@ async def admin_discount_percent(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("عدد بین ۱ تا ۱۰۰ وارد کنید.")
         return ADMIN_DISCOUNT_PERCENT
     context.user_data["new_disc_percent"] = p
-    await update.message.reply_text("حداکثر تعداد استفاده از این کد چقدر باشه؟ (برای نامحدود عدد ۰ را بفرستید):")
+    await update.message.reply_text(
+        "حداکثر تعداد استفاده از این کد چقدر باشه؟\n"
+        "(برای نامحدود عدد <b>۰</b> را بفرستید):",
+        parse_mode=ParseMode.HTML
+    )
     return ADMIN_DISCOUNT_LIMIT
 
 async def admin_discount_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         limit = int(update.message.text.strip())
+        if limit < 0:
+            raise ValueError
     except:
-        await update.message.reply_text("عدد معتبر وارد کنید.")
+        await update.message.reply_text("عدد معتبر وارد کنید (۰ = نامحدود).")
         return ADMIN_DISCOUNT_LIMIT
-    code = context.user_data["new_disc_code"]
-    percent = context.user_data["new_disc_percent"]
+    context.user_data["new_disc_limit"] = limit
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("۲۴ ساعت", callback_data="disc_exp_24"),
+            InlineKeyboardButton("۴۸ ساعت", callback_data="disc_exp_48"),
+        ],
+        [
+            InlineKeyboardButton("۷۲ ساعت", callback_data="disc_exp_72"),
+            InlineKeyboardButton("۷ روز", callback_data="disc_exp_168"),
+        ],
+        [
+            InlineKeyboardButton("۳۰ روز", callback_data="disc_exp_720"),
+            InlineKeyboardButton("بدون انقضا ∞", callback_data="disc_exp_0"),
+        ],
+        [InlineKeyboardButton("✏️ وارد کردن ساعت دلخواه", callback_data="disc_exp_custom")],
+    ])
+    await update.message.reply_text(
+        "⏰ <b>مدت اعتبار کد (کمپین)</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "چند ساعت این کد معتبر باشد؟\n"
+        "یا یکی از گزینه‌های آماده را انتخاب کنید:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb
+    )
+    return ADMIN_DISCOUNT_EXPIRE
+
+
+async def admin_discount_expire_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """انتخاب مدت از دکمه یا درخواست ورودی سفارشی"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # disc_exp_24 / disc_exp_0 / disc_exp_custom
+
+    if data == "disc_exp_custom":
+        await query.edit_message_text(
+            "✏️ تعداد ساعت اعتبار را وارد کنید (مثال: <code>48</code> برای ۴۸ ساعت):\n"
+            "عدد <b>۰</b> = بدون انقضا",
+            parse_mode=ParseMode.HTML
+        )
+        return ADMIN_DISCOUNT_EXPIRE
+
+    try:
+        hours = int(data.replace("disc_exp_", ""))
+    except:
+        hours = 0
+    return await _save_discount_code(update, context, hours, from_callback=True)
+
+
+async def admin_discount_expire(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دریافت ساعت دلخواه از متن"""
+    try:
+        hours = int(update.message.text.strip().replace(",", ""))
+        if hours < 0:
+            raise ValueError
+    except:
+        await update.message.reply_text("عدد معتبر وارد کنید (۰ = بدون انقضا):")
+        return ADMIN_DISCOUNT_EXPIRE
+    return await _save_discount_code(update, context, hours, from_callback=False)
+
+
+async def _save_discount_code(update, context, hours: int, from_callback: bool = False):
+    code = context.user_data.get("new_disc_code")
+    percent = context.user_data.get("new_disc_percent")
+    limit = context.user_data.get("new_disc_limit", 0)
+    if not code or percent is None:
+        msg = "❌ اطلاعات ناقص است. دوباره از ابتدا شروع کنید."
+        if from_callback:
+            await update.callback_query.edit_message_text(msg, reply_markup=main_keyboard(True))
+        else:
+            await update.message.reply_text(msg, reply_markup=main_keyboard(True))
+        return ConversationHandler.END
+
+    now = datetime.now()
+    expires_at = None
+    if hours > 0:
+        expires_at = (now + timedelta(hours=hours)).isoformat()
+
     async with aiosqlite.connect("bot.db") as db:
         try:
             await db.execute(
-                "INSERT INTO discount_codes (code, percent, max_uses) VALUES (?, ?, ?)",
-                (code, percent, limit)
+                """INSERT INTO discount_codes
+                   (code, percent, max_uses, expires_at, starts_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (code, percent, limit, expires_at, now.isoformat(), now.isoformat())
             )
             await db.commit()
-            await update.message.reply_text(
-                f"✅ کد تخفیف <code>{code}</code> با {percent}٪ تخفیف و ظرفیت {'نامحدود' if limit == 0 else limit} بار ساخته شد.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard(True)
-            )
-        except:
-            await update.message.reply_text("این کد قبلاً وجود دارد.")
+        except Exception:
+            err = "❌ این کد قبلاً وجود دارد."
+            if from_callback:
+                await update.callback_query.edit_message_text(err, reply_markup=main_keyboard(True))
+            else:
+                await update.message.reply_text(err, reply_markup=main_keyboard(True))
+            return ConversationHandler.END
+
+    if hours > 0:
+        exp_dt = now + timedelta(hours=hours)
+        if hours >= 24:
+            time_txt = f"{hours // 24} روز" + (f" و {hours % 24} ساعت" if hours % 24 else "")
+        else:
+            time_txt = f"{hours} ساعت"
+        expire_txt = f"⏰ اعتبار: <b>{time_txt}</b> (تا {exp_dt.strftime('%Y-%m-%d %H:%M')})"
+    else:
+        expire_txt = "⏰ اعتبار: <b>بدون انقضا</b>"
+
+    limit_txt = "نامحدود" if limit == 0 else str(limit)
+    text = (
+        f"✅ <b>کد تخفیف / کمپین ساخته شد</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎟 کد: <code>{code}</code>\n"
+        f"💰 تخفیف: <b>{percent}٪</b>\n"
+        f"🔢 ظرفیت: {limit_txt}\n"
+        f"{expire_txt}"
+    )
+    if from_callback:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(True)
+        )
+
+    for k in ("new_disc_code", "new_disc_percent", "new_disc_limit"):
+        context.user_data.pop(k, None)
     return ConversationHandler.END
 
 async def toggle_disc(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9340,6 +9554,10 @@ def main():
             ADMIN_DISCOUNT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_discount_code)],
             ADMIN_DISCOUNT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_discount_percent)],
             ADMIN_DISCOUNT_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_discount_limit)],
+            ADMIN_DISCOUNT_EXPIRE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_discount_expire),
+                CallbackQueryHandler(admin_discount_expire_btn, pattern="^disc_exp_"),
+            ],
             ADMIN_BAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_do_ban)],
             ADMIN_UNBAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_do_unban)],
             ADMIN_WARN_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_warn_target)],
