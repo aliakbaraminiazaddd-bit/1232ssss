@@ -7130,7 +7130,7 @@ async def admin_new_discount(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🎟 <b>ساخت کد تخفیف / کمپین</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "کد را وارد کنید (فقط حروف انگلیسی و عدد، بدون فاصله):\n"
-        "مثال: <code>SALE48H</code> یا <code>VIP20</code>",
+        "مثال: <code>NeXoRa24H</code> یا <code>VIP100</code>",
         parse_mode=ParseMode.HTML
     )
     return ADMIN_DISCOUNT_CODE
