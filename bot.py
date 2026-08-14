@@ -4218,24 +4218,10 @@ async def quick_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-def _usage_progress_bar(percent: float, width: int = 10) -> str:
-    """نوار پیشرفت متنی برای درصد مصرف"""
-    p = max(0.0, min(100.0, percent))
-    filled = int(round(p / 100 * width))
-    filled = min(width, max(0, filled))
-    return "█" * filled + "░" * (width - filled)
-
-
 async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data or ""
-    is_refresh = data.startswith("refresh_order_")
-    order_id = int(data.split("_")[-1])
-
-    if is_refresh:
-        await query.answer("🔄 در حال بروزرسانی از پنل…")
-    else:
-        await query.answer()
+    await query.answer()
+    order_id = int(query.data.split("_")[-1])
 
     async with aiosqlite.connect("bot.db") as db:
         async with db.execute(
@@ -4303,17 +4289,14 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     limit_gb = limit / (1024 ** 3) if limit > 0 else 0
                     remaining_gb = max(0, limit_gb - used_gb)
                     percent = (used / limit * 100) if limit > 0 else 0
-                    bar = _usage_progress_bar(percent)
 
                     text += (
                         f"\n\n📊 <b>وضعیت مصرف</b>\n"
                         f"—————————————\n"
-                        f"<code>[{bar}]</code> <b>{percent:.1f}٪</b>\n"
                         f"📉 استفاده‌شده: <b>{used_gb:.2f}</b> گیگ\n"
                         f"📈 باقی‌مانده: <b>{remaining_gb:.2f}</b> گیگ\n"
+                        f"📊 درصد مصرف: <b>{percent:.1f}٪</b>\n"
                     )
-                    if limit_gb > 0:
-                        text += f"📦 سقف حجم: <b>{limit_gb:.2f}</b> گیگ\n"
                     if expire_ts:
                         expire_dt = datetime.fromtimestamp(expire_ts)
                         now = datetime.now()
@@ -4321,18 +4304,11 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             days_left = (expire_dt - now).days
                             hours_left = int((expire_dt - now).total_seconds() / 3600) % 24
                             text += f"⏳ زمان باقی‌مانده: <b>{days_left} روز و {hours_left} ساعت</b>\n"
-                            text += f"📅 انقضا: <b>{expire_dt.strftime('%Y-%m-%d %H:%M')}</b>\n"
                         else:
                             text += f"⏰ وضعیت: <b>منقضی شده</b>\n"
                     if panel_status:
-                        status_map = {
-                            "active": "🟢 فعال",
-                            "disabled": "🔴 غیرفعال",
-                            "expired": "⏰ منقضی",
-                            "limited": "⚠️ محدود (حجم تمام)",
-                        }
+                        status_map = {"active": "🟢 فعال", "disabled": "🔴 غیرفعال", "expired": "⏰ منقضی", "limited": "⚠️ محدود"}
                         text += f"📌 وضعیت پنل: {status_map.get(panel_status, panel_status)}\n"
-                    text += f"🕐 آخرین بروزرسانی: <b>{datetime.now().strftime('%H:%M:%S')}</b>"
                 else:
                     text += "\n\n⚠️ اطلاعات مصرف از پنل دریافت نشد."
             except Exception as e:
@@ -4340,42 +4316,23 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += "\n\n⚠️ خطا در دریافت اطلاعات مصرف."
 
     kb = [[back_button("my_services")]]
-    if status == "paid":
-        # دکمه بروزرسانی همیشه برای سرویس پرداخت‌شده
-        kb.insert(0, [InlineKeyboardButton("🔄 بروزرسانی وضعیت", callback_data=f"refresh_order_{order_id}")])
-        if conf_data:
-            try:
-                conf = json.loads(conf_data)
-                text += f"\n\n🔗 لینک اشتراک:\n<code>{conf.get('subscription_url', '—')}</code>"
-                kb.insert(1, [
-                    InlineKeyboardButton("📷 QR Code", callback_data=f"qr_{order_id}"),
-                    InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
-                ])
-                kb.insert(2, [InlineKeyboardButton("📖 آموزش", callback_data=f"guide_{order_id}")])
-                kb.insert(3, [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")])
-                toggle_label = "🔴 خاموش کردن تمدید خودکار" if auto_renew else "🟢 روشن کردن تمدید خودکار"
-                kb.insert(4, [InlineKeyboardButton(toggle_label, callback_data=f"toggle_auto_renew_{order_id}")])
-                kb.insert(5, [InlineKeyboardButton("🔀 انتقال سرویس", callback_data=f"transfer_{order_id}")])
-            except Exception:
-                pass
+    if status == "paid" and conf_data:
+        try:
+            conf = json.loads(conf_data)
+            text += f"\n\n🔗 لینک اشتراک:\n<code>{conf.get('subscription_url', '—')}</code>"
+            kb.insert(0, [
+                InlineKeyboardButton("📷 QR Code", callback_data=f"qr_{order_id}"),
+                InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
+            ])
+            kb.insert(1, [InlineKeyboardButton("📖 آموزش", callback_data=f"guide_{order_id}")])
+            kb.insert(2, [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")])
+            toggle_label = "🔴 خاموش کردن تمدید خودکار" if auto_renew else "🟢 روشن کردن تمدید خودکار"
+            kb.insert(3, [InlineKeyboardButton(toggle_label, callback_data=f"toggle_auto_renew_{order_id}")])
+            kb.insert(4, [InlineKeyboardButton("🔀 انتقال سرویس", callback_data=f"transfer_{order_id}")])
+        except Exception:
+            pass
 
-    try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    except Exception as e:
-        # اگر متن یکسان باشد تلگرام خطا می‌دهد
-        if "not modified" in str(e).lower() or "Message is not modified" in str(e):
-            if is_refresh:
-                await query.answer("✅ وضعیت به‌روز است", show_alert=False)
-        else:
-            logger.error(f"order_detail edit: {e}")
-            try:
-                await context.bot.send_message(
-                    query.from_user.id, text,
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 
 async def toggle_auto_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9355,249 +9312,9 @@ async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 ریست تست همه کاربران", callback_data="admin_reset_all_tests")],
         [InlineKeyboardButton("🖥 مدیریت پنل‌ها", callback_data="admin_panels")],
         [InlineKeyboardButton("🔌 تست اتصال پنل‌ها", callback_data="admin_test_panels")],
-        [InlineKeyboardButton("📋 اطلاعات پنل مرزبان", callback_data="admin_panel_info")],
         [back_button("admin_panel")]
     ])
     await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-
-def _fmt_bytes(n: int) -> str:
-    try:
-        n = int(n or 0)
-    except Exception:
-        return "0 B"
-    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
-        if abs(n) < 1024:
-            return f"{n:.2f} {unit}" if unit != "B" else f"{n} B"
-        n /= 1024
-    return f"{n:.2f} EB"
-
-
-async def fetch_marzban_panel_stats(panel: dict) -> dict:
-    """
-    دریافت آمار پنل مرزبان:
-    - تعداد کاربران
-    - حجم کل مصرف‌شده
-    - وضعیت اتصال
-    """
-    result = {
-        "ok": False,
-        "error": None,
-        "users_count": 0,
-        "active_users": 0,
-        "disabled_users": 0,
-        "expired_users": 0,
-        "limited_users": 0,
-        "total_used": 0,
-        "total_limit": 0,
-        "version": None,
-        "cpu": None,
-        "mem": None,
-    }
-    try:
-        token = await get_panel_token(panel)
-        headers = {"Authorization": f"Bearer {token}"}
-        base = panel["url"].rstrip("/")
-        async with httpx.AsyncClient(timeout=45.0, verify=False) as client:
-            # آمار سیستم (اگر موجود باشد)
-            try:
-                sys_res = await client.get(f"{base}/api/system", headers=headers)
-                if sys_res.status_code == 200:
-                    sys_data = sys_res.json()
-                    result["version"] = sys_data.get("version")
-                    # فیلدهای رایج مرزبان
-                    if "users_count" in sys_data:
-                        result["users_count"] = int(sys_data.get("users_count") or 0)
-                    if "active_users" in sys_data:
-                        result["active_users"] = int(sys_data.get("active_users") or 0)
-                    # مصرف کل گاهی در system هست
-                    for key in ("total_user_usage", "outgoing_bandwidth", "incoming_bandwidth"):
-                        if key in sys_data and sys_data[key] is not None:
-                            try:
-                                result["total_used"] = max(
-                                    result["total_used"], int(sys_data[key] or 0)
-                                )
-                            except Exception:
-                                pass
-                    cpu = sys_data.get("cpu_usage") or sys_data.get("cpu")
-                    mem = sys_data.get("mem_usage") or sys_data.get("memory")
-                    if cpu is not None:
-                        result["cpu"] = cpu
-                    if mem is not None:
-                        result["mem"] = mem
-            except Exception as e:
-                logger.warning(f"panel system api: {e}")
-
-            # لیست کاربران برای شمارش دقیق‌تر و جمع مصرف
-            total_used = 0
-            total_limit = 0
-            users_count = 0
-            active = disabled = expired = limited = 0
-            offset = 0
-            limit = 200
-            while True:
-                res = await client.get(
-                    f"{base}/api/users",
-                    headers=headers,
-                    params={"offset": offset, "limit": limit},
-                )
-                if res.status_code != 200:
-                    if users_count == 0 and not result["users_count"]:
-                        result["error"] = f"خطا در دریافت کاربران: {res.status_code}"
-                    break
-                data = res.json()
-                users = data.get("users") if isinstance(data, dict) else data
-                if not isinstance(users, list) or not users:
-                    # total در پاسخ
-                    if isinstance(data, dict) and data.get("total") is not None and users_count == 0:
-                        users_count = int(data.get("total") or 0)
-                    break
-                for u in users:
-                    users_count += 1
-                    st = (u.get("status") or "").lower()
-                    if st == "active":
-                        active += 1
-                    elif st == "disabled":
-                        disabled += 1
-                    elif st == "expired":
-                        expired += 1
-                    elif st == "limited":
-                        limited += 1
-                    used = u.get("used_traffic") or 0
-                    lim = u.get("data_limit") or 0
-                    try:
-                        total_used += int(used)
-                    except Exception:
-                        pass
-                    try:
-                        total_limit += int(lim)
-                    except Exception:
-                        pass
-                if len(users) < limit:
-                    break
-                offset += limit
-                if offset > 20000:  # سقف ایمنی
-                    break
-
-            result["ok"] = True
-            if users_count:
-                result["users_count"] = users_count
-            result["active_users"] = active
-            result["disabled_users"] = disabled
-            result["expired_users"] = expired
-            result["limited_users"] = limited
-            if total_used:
-                result["total_used"] = total_used
-            result["total_limit"] = total_limit
-    except Exception as e:
-        result["error"] = str(e)[:200]
-        logger.error(f"fetch_marzban_panel_stats: {e}")
-    return result
-
-
-async def admin_panel_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش اطلاعات اتصال و آمار پنل مرزبان برای ادمین"""
-    query = update.callback_query
-    await query.answer()
-    if not await is_admin(query.from_user.id):
-        return
-
-    await query.edit_message_text(
-        "⏳ در حال دریافت اطلاعات از پنل مرزبان…",
-        parse_mode=ParseMode.HTML,
-    )
-
-    # همه پنل‌های فعال از دیتابیس
-    async with aiosqlite.connect("bot.db") as db:
-        async with db.execute(
-            """SELECT name, url, username, password, panel_type, is_active
-               FROM panels WHERE is_active = 1 ORDER BY id"""
-        ) as cur:
-            panels_rows = await cur.fetchall()
-
-    if not panels_rows:
-        # fallback به ثابت‌های کد
-        panels_rows = [
-            ("پیش‌فرض", PANEL_URL, PANEL_USERNAME, PANEL_PASSWORD, "holland", 1)
-        ]
-
-    # یکتا بر اساس URL تا تکراری نشان ندهیم
-    seen_urls = set()
-    unique_panels = []
-    for row in panels_rows:
-        url = (row[1] or "").rstrip("/")
-        if url in seen_urls:
-            continue
-        seen_urls.add(url)
-        unique_panels.append(row)
-
-    parts = []
-    for name, url, username, password, ptype, _active in unique_panels:
-        panel = {
-            "url": url,
-            "username": username,
-            "password": password,
-            "name": name,
-            "panel_type": ptype,
-        }
-        stats = await fetch_marzban_panel_stats(panel)
-        type_label = {
-            "holland": "هلند",
-            "multi": "مولتی",
-            "unlimited": "نامحدود",
-            "test": "تست",
-        }.get(ptype, ptype or "—")
-
-        block = (
-            f"🖥 <b>{name or 'پنل'}</b> ({type_label})\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🌐 آدرس:\n<code>{url}</code>\n"
-            f"👤 نام کاربری: <code>{username}</code>\n"
-            f"🔑 رمز عبور: <code>{password}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-        )
-        if stats.get("ok"):
-            block += (
-                f"👥 تعداد کاربران: <b>{stats['users_count']:,}</b>\n"
-                f"   🟢 فعال: {stats['active_users']:,}\n"
-                f"   🔴 غیرفعال: {stats['disabled_users']:,}\n"
-                f"   ⏰ منقضی: {stats['expired_users']:,}\n"
-                f"   ⚠️ محدود: {stats['limited_users']:,}\n"
-                f"📊 حجم کل مصرف‌شده: <b>{_fmt_bytes(stats['total_used'])}</b>\n"
-            )
-            if stats.get("total_limit"):
-                block += f"📦 مجموع سقف حجم: <b>{_fmt_bytes(stats['total_limit'])}</b>\n"
-            if stats.get("version"):
-                block += f"🏷 نسخه مرزبان: <code>{stats['version']}</code>\n"
-            if stats.get("cpu") is not None:
-                block += f"🧠 CPU: {stats['cpu']}\n"
-            if stats.get("mem") is not None:
-                block += f"💾 Memory: {stats['mem']}\n"
-            block += f"✅ اتصال: برقرار"
-        else:
-            block += (
-                f"❌ اتصال ناموفق\n"
-                f"⚠️ {stats.get('error') or 'خطای نامشخص'}"
-            )
-        parts.append(block)
-
-    text = "📋 <b>اطلاعات پنل مرزبان</b>\n\n" + "\n\n".join(parts)
-    if len(text) > 3900:
-        text = text[:3890] + "…"
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin_panel_info")],
-        [InlineKeyboardButton("🖥 مدیریت پنل‌ها", callback_data="admin_panels")],
-        [back_button("admin_settings")],
-    ])
-    try:
-        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        if "not modified" not in str(e).lower():
-            await context.bot.send_message(
-                query.from_user.id, text, reply_markup=kb, parse_mode=ParseMode.HTML
-            )
-
 
 async def admin_set_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -10508,7 +10225,6 @@ def main():
     application.add_handler(CallbackQueryHandler(remove_discount, pattern="^remove_discount$"))
     application.add_handler(CallbackQueryHandler(my_services, pattern="^my_services$"))
     application.add_handler(CallbackQueryHandler(order_detail, pattern="^order_detail_"))
-    application.add_handler(CallbackQueryHandler(order_detail, pattern="^refresh_order_"))
     application.add_handler(CallbackQueryHandler(test_account, pattern="^test_account$"))
     application.add_handler(CallbackQueryHandler(test_auto_name, pattern="^test_auto_name$"))
     application.add_handler(CallbackQueryHandler(wallet, pattern="^wallet$"))
@@ -10561,7 +10277,6 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_toggle_maintenance, pattern="^admin_toggle_maintenance$"))
     application.add_handler(CallbackQueryHandler(pay_with_wallet, pattern="^pay_with_wallet$"))
     application.add_handler(CallbackQueryHandler(admin_panels, pattern="^admin_panels$"))
-    application.add_handler(CallbackQueryHandler(admin_panel_info, pattern="^admin_panel_info$"))
     application.add_handler(CallbackQueryHandler(admin_test_panels, pattern="^admin_test_panels$"))
     application.add_handler(CallbackQueryHandler(admin_panel_type, pattern="^panel_type_"))
     application.add_handler(CallbackQueryHandler(toggle_panel, pattern="^toggle_panel_"))
