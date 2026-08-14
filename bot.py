@@ -46,6 +46,7 @@ MAX_PENDING_ORDERS = 2          # حداکثر سفارش در انتظار هم
 USAGE_WARNING_PERCENT = 85      # درصد هشدار مصرف
 EXPIRE_WARN_HOURS = 24          # چند ساعت قبل از انقضا هشدار بده
 AUTO_RENEW_HOURS = 24           # چند ساعت قبل از انقضا تمدید خودکار انجام شود
+BALANCE_WARN_HOURS = 72         # چند ساعت قبل از انقضا هشدار کمبود موجودی برای تمدید خودکار
 TEST_DELETE_AFTER_HOURS = 48    # حذف خودکار اکانت تست بعد از چند ساعت
 
 # پروکسی — قیمت‌های پایه (قابل تغییر از پنل ادمین)
@@ -181,7 +182,8 @@ async def init_db():
                 expire_warned INTEGER DEFAULT 0,
                 panel_username TEXT,
                 tracking_code TEXT,
-                auto_renew INTEGER DEFAULT 0
+                auto_renew INTEGER DEFAULT 0,
+                balance_warned INTEGER DEFAULT 0
             )
         """)
         # ستون‌های جدید برای دیتابیس‌های قدیمی
@@ -191,6 +193,7 @@ async def init_db():
             ("panel_username", "TEXT"),
             ("tracking_code", "TEXT"),
             ("auto_renew", "INTEGER DEFAULT 0"),
+            ("balance_warned", "INTEGER DEFAULT 0"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
@@ -665,6 +668,64 @@ async def log_admin_action(admin_id: int, action: str, target_id: int = None, de
             await db.commit()
     except Exception as e:
         logger.error(f"log_admin_action: {e}")
+
+
+async def notify_admin_sale(
+    bot,
+    *,
+    kind: str,
+    order_id: int,
+    user_id: int,
+    amount: int,
+    plan: str,
+    payment: str = "—",
+    extra: str = None,
+):
+    """
+    اعلان لحظه‌ای فروش موفق به ادمین اصلی.
+    kind: service | renew | auto_renew | proxy | wallet
+    """
+    try:
+        kind_map = {
+            "service": "🛒 خرید سرویس",
+            "renew": "🔄 تمدید سرویس",
+            "auto_renew": "🤖 تمدید خودکار",
+            "proxy": "🌐 خرید پروکسی",
+            "wallet": "💳 شارژ کیف پول",
+        }
+        title = kind_map.get(kind, "💰 فروش")
+        # نام کاربر
+        uname = "—"
+        full_name = "—"
+        try:
+            async with aiosqlite.connect("bot.db") as db:
+                async with db.execute(
+                    "SELECT full_name, username FROM users WHERE user_id = ?", (user_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                if row:
+                    full_name = row[0] or "—"
+                    uname = f"@{row[1]}" if row[1] else "—"
+        except Exception:
+            pass
+
+        text = (
+            f"{title}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📦 {plan}\n"
+            f"💰 مبلغ: <b>{amount:,}</b> تومان\n"
+            f"💳 پرداخت: {payment}\n"
+            f"👤 {full_name} ({uname})\n"
+            f"🆔 <code>{user_id}</code>\n"
+            f"🔢 سفارش: #{order_id}\n"
+            f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        if extra:
+            text += f"\n{extra}"
+
+        await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"notify_admin_sale: {e}")
 
 
 async def check_receipt_rate_limit(user_id: int) -> bool:
@@ -1416,9 +1477,23 @@ async def _do_auto_renew(bot, order_id: int, user_id: int, username: str, vol: i
                  json.dumps({"renewed_from": order_id, "type": "auto_renew"}))
             )
             await db.execute(
-                "UPDATE orders SET warned_85 = 0, expire_warned = 0 WHERE id = ?", (order_id,)
+                "UPDATE orders SET warned_85 = 0, expire_warned = 0, balance_warned = 0 WHERE id = ?",
+                (order_id,),
             )
             await db.commit()
+
+        try:
+            await notify_admin_sale(
+                bot,
+                kind="auto_renew",
+                order_id=order_id,
+                user_id=user_id,
+                amount=price,
+                plan=f"{server_type} — {vol}G (تمدید خودکار)",
+                payment="کیف پول",
+            )
+        except Exception:
+            pass
 
         try:
             await bot.send_message(
@@ -1460,12 +1535,12 @@ async def check_usage_and_expire(context: ContextTypes.DEFAULT_TYPE):
         async with aiosqlite.connect("bot.db") as db:
             async with db.execute(
                 """SELECT id, user_id, config_name, panel_username, volume_gb, config_data,
-                          warned_85, expire_warned, server_type, auto_renew
+                          warned_85, expire_warned, server_type, auto_renew, balance_warned
                    FROM orders WHERE status = 'paid' AND (config_name IS NOT NULL OR panel_username IS NOT NULL)"""
             ) as cur:
                 orders = await cur.fetchall()
 
-        for order_id, user_id, conf_name, panel_username, vol, conf_data, warned_85, expire_warned, server_type, auto_renew in orders:
+        for order_id, user_id, conf_name, panel_username, vol, conf_data, warned_85, expire_warned, server_type, auto_renew, balance_warned in orders:
             lookup_name = (panel_username or conf_name or "").strip()
             if not lookup_name:
                 if conf_data:
@@ -1507,6 +1582,53 @@ async def check_usage_and_expire(context: ContextTypes.DEFAULT_TYPE):
                                 await db.commit()
                         except Exception as e:
                             logger.error(f"send 85% warn error: {e}")
+
+                # هشدار کمبود موجودی برای تمدید خودکار (زودتر از لحظه تمدید)
+                if expire_ts and (auto_renew or 0) and not (balance_warned or 0):
+                    now_ts = int(datetime.now().timestamp())
+                    hours_left = (expire_ts - now_ts) / 3600
+                    if 0 < hours_left <= BALANCE_WARN_HOURS:
+                        try:
+                            async with aiosqlite.connect("bot.db") as db:
+                                async with db.execute(
+                                    "SELECT price FROM tariffs WHERE server_type = ? AND volume_gb = ? AND is_active = 1 LIMIT 1",
+                                    (server_type, vol),
+                                ) as cur:
+                                    pr = await cur.fetchone()
+                                renew_price = pr[0] if pr else 0
+                                async with db.execute(
+                                    "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+                                ) as cur:
+                                    br = await cur.fetchone()
+                                bal = br[0] if br else 0
+                            if renew_price > 0 and bal < renew_price:
+                                need = renew_price - bal
+                                await context.bot.send_message(
+                                    user_id,
+                                    f"💳 <b>یادآوری شارژ کیف پول</b>\n"
+                                    f"━━━━━━━━━━━━━━━━━━\n"
+                                    f"تمدید خودکار سرویس <code>{lookup_name}</code> روشن است،\n"
+                                    f"اما موجودی برای تمدید کافی نیست.\n\n"
+                                    f"⏳ حدود <b>{int(hours_left)}</b> ساعت تا انقضا\n"
+                                    f"💰 هزینه تمدید: <b>{renew_price:,}</b> تومان\n"
+                                    f"💳 موجودی فعلی: <b>{bal:,}</b> تومان\n"
+                                    f"➕ کمبود: <b>{need:,}</b> تومان\n\n"
+                                    f"قبل از انقضا کیف پول را شارژ کنید تا سرویس قطع نشود.",
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=InlineKeyboardMarkup([
+                                        [InlineKeyboardButton("💰 شارژ کیف پول", callback_data="wallet")],
+                                        [InlineKeyboardButton("🔄 تمدید دستی", callback_data=f"renew_{order_id}")],
+                                        [InlineKeyboardButton("📦 سرویس‌های من", callback_data="my_services")],
+                                    ]),
+                                )
+                                async with aiosqlite.connect("bot.db") as db:
+                                    await db.execute(
+                                        "UPDATE orders SET balance_warned = 1 WHERE id = ?",
+                                        (order_id,),
+                                    )
+                                    await db.commit()
+                        except Exception as e:
+                            logger.error(f"balance warn order {order_id}: {e}")
 
                 # تمدید خودکار (قبل از هشدار انقضا)
                 if expire_ts and (auto_renew or 0):
@@ -2449,6 +2571,18 @@ async def pay_with_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ پرداخت با کیف پول موفق بود.\nسفارش #{order_id} تحویل داده شد.\n🔖 کد رهگیری: <code>{tracking}</code>",
             parse_mode=ParseMode.HTML
         )
+        # اعلان فروش به ادمین
+        sname = {"holland": "هلند", "multi": "مولتی", "unlimited": "نامحدود", "custom": "دلخواه"}.get(server, server)
+        plan_txt = f"{sname} — {vol}G" if server != "unlimited" else f"{sname} — {vol} ماهه"
+        await notify_admin_sale(
+            context.bot,
+            kind="service",
+            order_id=order_id,
+            user_id=user.id,
+            amount=final,
+            plan=plan_txt,
+            payment="کیف پول",
+        )
         # هدیه خرید ۵ سرویس
         await maybe_grant_loyalty_gift(context.bot, user.id)
     except Exception as e:
@@ -2660,6 +2794,17 @@ async def approve_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # هدیه خرید ۵ سرویس
         await maybe_grant_loyalty_gift(context.bot, user_id)
         await log_admin_action(query.from_user.id, "approve_order", order_id, f"user={user_id}")
+        sname = {"holland": "هلند", "multi": "مولتی", "unlimited": "نامحدود", "custom": "دلخواه"}.get(server, server)
+        plan_txt = f"{sname} — {vol}G" if server != "unlimited" else f"{sname} — {vol} ماهه"
+        await notify_admin_sale(
+            context.bot,
+            kind="service",
+            order_id=order_id,
+            user_id=user_id,
+            amount=price or 0,
+            plan=plan_txt,
+            payment="رسید / تأیید ادمین",
+        )
     except Exception as e:
         logger.error(e)
 
@@ -3038,7 +3183,8 @@ async def renew_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             # ریست فلگ‌های هشدار سفارش اصلی
             await db.execute(
-                "UPDATE orders SET warned_85 = 0, expire_warned = 0 WHERE id = ?", (order_id,)
+                "UPDATE orders SET warned_85 = 0, expire_warned = 0, balance_warned = 0 WHERE id = ?",
+                (order_id,),
             )
             await db.commit()
 
@@ -3047,6 +3193,15 @@ async def renew_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 {vol} گیگ حجم اضافه شد\n"
             f"⏳ {service_days} روز اعتبار اضافه شد\n"
             f"💰 مبلغ کسر شده: {final:,} تومان"
+        )
+        await notify_admin_sale(
+            context.bot,
+            kind="renew",
+            order_id=order_id,
+            user_id=user.id,
+            amount=final,
+            plan=f"{server or '—'} — {vol}G (تمدید)",
+            payment="کیف پول",
         )
     except Exception as e:
         logger.error(e)
@@ -3144,14 +3299,14 @@ async def approve_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = int(query.data.split("_")[-1])
     async with aiosqlite.connect("bot.db") as db:
         async with db.execute(
-            "SELECT user_id, volume_gb, config_name, config_data, server_type FROM orders WHERE id = ? AND status = 'pending'",
+            "SELECT user_id, volume_gb, config_name, config_data, server_type, final_price FROM orders WHERE id = ? AND status = 'pending'",
             (order_id,)
         ) as cur:
             row = await cur.fetchone()
         if not row:
             await query.answer("قبلاً بررسی شده", show_alert=True)
             return
-        user_id, vol, username, conf_data_str, server_type = row
+        user_id, vol, username, conf_data_str, server_type, final_price = row
 
         try:
             conf_data = json.loads(conf_data_str) if conf_data_str else {}
@@ -3184,7 +3339,8 @@ async def approve_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if original_order:
             await db.execute(
-                "UPDATE orders SET warned_85 = 0, expire_warned = 0 WHERE id = ?", (original_order,)
+                "UPDATE orders SET warned_85 = 0, expire_warned = 0, balance_warned = 0 WHERE id = ?",
+                (original_order,),
             )
         await db.commit()
 
@@ -3200,7 +3356,23 @@ async def approve_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    await query.edit_message_caption(caption=(query.message.caption or "") + "\n\n✅ تمدید تأیید شد")
+    await notify_admin_sale(
+        context.bot,
+        kind="renew",
+        order_id=order_id,
+        user_id=user_id,
+        amount=final_price or 0,
+        plan=f"{server_type or '—'} — {vol}G (تمدید)",
+        payment="رسید / تأیید ادمین",
+    )
+
+    try:
+        await query.edit_message_caption(caption=(query.message.caption or "") + "\n\n✅ تمدید تأیید شد")
+    except Exception:
+        try:
+            await query.edit_message_text((query.message.text or "") + "\n\n✅ تمدید تأیید شد")
+        except Exception:
+            pass
 
 # ==================== پروکسی ====================
 PROXY_LOCATIONS = {
@@ -3581,6 +3753,15 @@ async def proxy_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ پرداخت با کیف پول موفق بود.\nسفارش پروکسی #{order_id} تحویل داده شد.\n🔖 کد رهگیری: <code>{tracking}</code>",
         parse_mode=ParseMode.HTML
     )
+    await notify_admin_sale(
+        context.bot,
+        kind="proxy",
+        order_id=order_id,
+        user_id=user.id,
+        amount=final,
+        plan=f"{loc_name} — {qty} عدد / {days} روز",
+        payment="کیف پول",
+    )
     context.user_data.clear()
 
 async def approve_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3644,6 +3825,15 @@ async def approve_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"approve_proxy notify: {e}")
 
     await log_admin_action(query.from_user.id, "approve_proxy", order_id)
+    await notify_admin_sale(
+        context.bot,
+        kind="proxy",
+        order_id=order_id,
+        user_id=user_id,
+        amount=price or 0,
+        plan=f"{loc_name} — {qty} عدد / {days} روز",
+        payment="رسید / تأیید ادمین",
+    )
     try:
         await notify_proxy_low_stock(context.bot, location)
     except Exception:
@@ -4760,6 +4950,16 @@ async def approve_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"notify charge approve {user_id}: {e}")
 
     await log_admin_action(query.from_user.id, "approve_charge", charge_id)
+    await notify_admin_sale(
+        context.bot,
+        kind="wallet",
+        order_id=charge_id,
+        user_id=user_id,
+        amount=amount,
+        plan="شارژ کیف پول" + (f" + هدیه {bonus:,}" if bonus else ""),
+        payment="رسید / تأیید ادمین",
+        extra=f"💳 موجودی جدید کاربر: <b>{new_balance:,}</b> تومان" if new_balance is not None else None,
+    )
     # آپدیت پیام ادمین
     caption = (query.message.caption or query.message.text or "") + f"\n\n✅ تأیید شد"
     if bonus > 0:
