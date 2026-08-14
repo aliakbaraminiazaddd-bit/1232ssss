@@ -4218,10 +4218,24 @@ async def quick_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _usage_progress_bar(percent: float, width: int = 10) -> str:
+    """نوار پیشرفت متنی برای درصد مصرف"""
+    p = max(0.0, min(100.0, percent))
+    filled = int(round(p / 100 * width))
+    filled = min(width, max(0, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
 async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    order_id = int(query.data.split("_")[-1])
+    data = query.data or ""
+    is_refresh = data.startswith("refresh_order_")
+    order_id = int(data.split("_")[-1])
+
+    if is_refresh:
+        await query.answer("🔄 در حال بروزرسانی از پنل…")
+    else:
+        await query.answer()
 
     async with aiosqlite.connect("bot.db") as db:
         async with db.execute(
@@ -4289,14 +4303,17 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     limit_gb = limit / (1024 ** 3) if limit > 0 else 0
                     remaining_gb = max(0, limit_gb - used_gb)
                     percent = (used / limit * 100) if limit > 0 else 0
+                    bar = _usage_progress_bar(percent)
 
                     text += (
                         f"\n\n📊 <b>وضعیت مصرف</b>\n"
                         f"—————————————\n"
+                        f"<code>[{bar}]</code> <b>{percent:.1f}٪</b>\n"
                         f"📉 استفاده‌شده: <b>{used_gb:.2f}</b> گیگ\n"
                         f"📈 باقی‌مانده: <b>{remaining_gb:.2f}</b> گیگ\n"
-                        f"📊 درصد مصرف: <b>{percent:.1f}٪</b>\n"
                     )
+                    if limit_gb > 0:
+                        text += f"📦 سقف حجم: <b>{limit_gb:.2f}</b> گیگ\n"
                     if expire_ts:
                         expire_dt = datetime.fromtimestamp(expire_ts)
                         now = datetime.now()
@@ -4304,11 +4321,18 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             days_left = (expire_dt - now).days
                             hours_left = int((expire_dt - now).total_seconds() / 3600) % 24
                             text += f"⏳ زمان باقی‌مانده: <b>{days_left} روز و {hours_left} ساعت</b>\n"
+                            text += f"📅 انقضا: <b>{expire_dt.strftime('%Y-%m-%d %H:%M')}</b>\n"
                         else:
                             text += f"⏰ وضعیت: <b>منقضی شده</b>\n"
                     if panel_status:
-                        status_map = {"active": "🟢 فعال", "disabled": "🔴 غیرفعال", "expired": "⏰ منقضی", "limited": "⚠️ محدود"}
+                        status_map = {
+                            "active": "🟢 فعال",
+                            "disabled": "🔴 غیرفعال",
+                            "expired": "⏰ منقضی",
+                            "limited": "⚠️ محدود (حجم تمام)",
+                        }
                         text += f"📌 وضعیت پنل: {status_map.get(panel_status, panel_status)}\n"
+                    text += f"🕐 آخرین بروزرسانی: <b>{datetime.now().strftime('%H:%M:%S')}</b>"
                 else:
                     text += "\n\n⚠️ اطلاعات مصرف از پنل دریافت نشد."
             except Exception as e:
@@ -4316,23 +4340,42 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += "\n\n⚠️ خطا در دریافت اطلاعات مصرف."
 
     kb = [[back_button("my_services")]]
-    if status == "paid" and conf_data:
-        try:
-            conf = json.loads(conf_data)
-            text += f"\n\n🔗 لینک اشتراک:\n<code>{conf.get('subscription_url', '—')}</code>"
-            kb.insert(0, [
-                InlineKeyboardButton("📷 QR Code", callback_data=f"qr_{order_id}"),
-                InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
-            ])
-            kb.insert(1, [InlineKeyboardButton("📖 آموزش", callback_data=f"guide_{order_id}")])
-            kb.insert(2, [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")])
-            toggle_label = "🔴 خاموش کردن تمدید خودکار" if auto_renew else "🟢 روشن کردن تمدید خودکار"
-            kb.insert(3, [InlineKeyboardButton(toggle_label, callback_data=f"toggle_auto_renew_{order_id}")])
-            kb.insert(4, [InlineKeyboardButton("🔀 انتقال سرویس", callback_data=f"transfer_{order_id}")])
-        except Exception:
-            pass
+    if status == "paid":
+        # دکمه بروزرسانی همیشه برای سرویس پرداخت‌شده
+        kb.insert(0, [InlineKeyboardButton("🔄 بروزرسانی وضعیت", callback_data=f"refresh_order_{order_id}")])
+        if conf_data:
+            try:
+                conf = json.loads(conf_data)
+                text += f"\n\n🔗 لینک اشتراک:\n<code>{conf.get('subscription_url', '—')}</code>"
+                kb.insert(1, [
+                    InlineKeyboardButton("📷 QR Code", callback_data=f"qr_{order_id}"),
+                    InlineKeyboardButton("📄 دانلود فایل", callback_data=f"dlcfg_{order_id}"),
+                ])
+                kb.insert(2, [InlineKeyboardButton("📖 آموزش", callback_data=f"guide_{order_id}")])
+                kb.insert(3, [InlineKeyboardButton("🔄 تمدید سرویس", callback_data=f"renew_{order_id}")])
+                toggle_label = "🔴 خاموش کردن تمدید خودکار" if auto_renew else "🟢 روشن کردن تمدید خودکار"
+                kb.insert(4, [InlineKeyboardButton(toggle_label, callback_data=f"toggle_auto_renew_{order_id}")])
+                kb.insert(5, [InlineKeyboardButton("🔀 انتقال سرویس", callback_data=f"transfer_{order_id}")])
+            except Exception:
+                pass
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        # اگر متن یکسان باشد تلگرام خطا می‌دهد
+        if "not modified" in str(e).lower() or "Message is not modified" in str(e):
+            if is_refresh:
+                await query.answer("✅ وضعیت به‌روز است", show_alert=False)
+        else:
+            logger.error(f"order_detail edit: {e}")
+            try:
+                await context.bot.send_message(
+                    query.from_user.id, text,
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
 
 
 async def toggle_auto_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10225,6 +10268,7 @@ def main():
     application.add_handler(CallbackQueryHandler(remove_discount, pattern="^remove_discount$"))
     application.add_handler(CallbackQueryHandler(my_services, pattern="^my_services$"))
     application.add_handler(CallbackQueryHandler(order_detail, pattern="^order_detail_"))
+    application.add_handler(CallbackQueryHandler(order_detail, pattern="^refresh_order_"))
     application.add_handler(CallbackQueryHandler(test_account, pattern="^test_account$"))
     application.add_handler(CallbackQueryHandler(test_auto_name, pattern="^test_auto_name$"))
     application.add_handler(CallbackQueryHandler(wallet, pattern="^wallet$"))
