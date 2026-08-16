@@ -467,8 +467,8 @@ async def init_db():
             ("maintenance", "0"),
             ("maintenance_until", ""),
             ("channel_username", CHANNEL_USERNAME),
-            ("custom_price_per_gb", "12000"),   # قیمت هر گیگ در پلن دلخواه
-            ("custom_price_per_day", "3000"),   # قیمت هر روز در پلن دلخواه
+            ("custom_price_per_gb", "3900"),   # قیمت هر گیگ در پلن دلخواه
+            ("custom_price_per_day", "500"),   # قیمت هر روز در پلن دلخواه
             ("custom_min_gb", "5"),
             ("custom_max_gb", "200"),
             ("custom_min_days", "7"),
@@ -2237,8 +2237,8 @@ async def start_custom_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     min_gb = await get_int_setting("custom_min_gb", 5)
     max_gb = await get_int_setting("custom_max_gb", 200)
-    price_gb = await get_int_setting("custom_price_per_gb", 12000)
-    price_day = await get_int_setting("custom_price_per_day", 3000)
+    price_gb = await get_int_setting("custom_price_per_gb", 3900)
+    price_day = await get_int_setting("custom_price_per_day", 500)
 
     context.user_data["server_type"] = "custom"
     context.user_data["discount_code"] = None
@@ -2299,8 +2299,8 @@ async def custom_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     context.user_data["custom_days"] = days
     gb = context.user_data["volume"]
-    price_gb = await get_int_setting("custom_price_per_gb", 12000)
-    price_day = await get_int_setting("custom_price_per_day", 3000)
+    price_gb = await get_int_setting("custom_price_per_gb", 3900)
+    price_day = await get_int_setting("custom_price_per_day", 500)
 
     price = (gb * price_gb) + (days * price_day)
     context.user_data["price"] = price
@@ -2769,8 +2769,8 @@ async def remove_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # قیمت پلن دلخواه از قبل محاسبه شده — دوباره از volume/days حساب نکن
         gb = context.user_data.get("volume", 0)
         d = context.user_data.get("custom_days", 30)
-        price_gb = await get_int_setting("custom_price_per_gb", 12000)
-        price_day = await get_int_setting("custom_price_per_day", 3000)
+        price_gb = await get_int_setting("custom_price_per_gb", 3900)
+        price_day = await get_int_setting("custom_price_per_day", 500)
         context.user_data["final_price"] = (gb * price_gb) + (d * price_day)
     else:
         context.user_data["final_price"] = base
