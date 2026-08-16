@@ -8,6 +8,15 @@ import asyncio
 import os
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# ساعت رسمی ایران برای نمایش و تعمیرات زمان‌دار
+TEHRAN_TZ = ZoneInfo('Asia/Tehran')
+
+def now_tehran() -> datetime:
+    """زمان فعلی به وقت ایران (بدون tzinfo برای سازگاری با iso ذخیره شده)"""
+    return datetime.now(TEHRAN_TZ).replace(tzinfo=None)
+
 from io import BytesIO
 from typing import Optional
 
@@ -960,14 +969,16 @@ async def issue_warning(bot, user_id: int, reason: str = None, issued_by: int = 
     return warnings, banned
 
 async def is_maintenance() -> bool:
-    """تعمیرات دستی یا زمان‌دار (maintenance_until)"""
+    """تعمیرات دستی یا زمان‌دار (maintenance_until) — بر اساس ساعت ایران"""
     if (await get_setting("maintenance")) == "1":
         until = await get_setting("maintenance_until")
         if until:
             try:
                 end_dt = datetime.fromisoformat(until)
-                if datetime.now() >= end_dt:
-                    # منقضی شده → خاموش کن
+                # اگر tz داشت، به تهران تبدیل و naive کن
+                if end_dt.tzinfo is not None:
+                    end_dt = end_dt.astimezone(TEHRAN_TZ).replace(tzinfo=None)
+                if now_tehran() >= end_dt:
                     await set_setting("maintenance", "0")
                     await set_setting("maintenance_until", "")
                     return False
@@ -978,20 +989,25 @@ async def is_maintenance() -> bool:
 
 
 async def get_maintenance_info() -> str:
-    """متن وضعیت تعمیرات برای نمایش در تنظیمات"""
+    """متن وضعیت تعمیرات برای نمایش در تنظیمات (ساعت ایران)"""
     if not await is_maintenance():
         return "🟢 غیرفعال"
     until = await get_setting("maintenance_until")
     if until:
         try:
             end_dt = datetime.fromisoformat(until)
-            remain = end_dt - datetime.now()
+            if end_dt.tzinfo is not None:
+                end_dt = end_dt.astimezone(TEHRAN_TZ).replace(tzinfo=None)
+            remain = end_dt - now_tehran()
             mins = max(0, int(remain.total_seconds() // 60))
             if mins >= 60:
-                t = f"{mins // 60}س و {mins % 60}د"
+                t = f"{mins // 60} ساعت و {mins % 60} دقیقه"
             else:
                 t = f"{mins} دقیقه"
-            return f"🔴 فعال تا {end_dt.strftime('%Y-%m-%d %H:%M')} (باقی‌مانده: {t})"
+            return (
+                f"🔴 فعال تا {end_dt.strftime('%Y/%m/%d %H:%M')} "
+                f"(ایران) — باقی‌مانده: {t}"
+            )
         except Exception:
             return "🔴 فعال (زمان‌دار)"
     return "🔴 فعال (دستی)"
@@ -8410,10 +8426,11 @@ async def maint_timed_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         "⏱ <b>تعمیرات زمان‌دار</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 ساعت فعلی ایران: <b>{now_tehran().strftime('%Y/%m/%d %H:%M')}</b>\n\n"
         "مدت تعمیرات را به <b>ساعت</b> وارد کنید.\n"
-        "مثال: <code>2</code> یعنی ۲ ساعت\n"
-        "یا <code>0.5</code> برای ۳۰ دقیقه\n\n"
-        "بعد از پایان این مدت، تعمیرات خودکار خاموش می‌شود.",
+        "مثال: <code>1</code> → یک ساعت از همین الان\n"
+        "یا <code>0.5</code> → ۳۰ دقیقه\n\n"
+        "زمان پایان بر اساس <b>ساعت ایران</b> محاسبه می‌شود و بعد از آن خودکار خاموش می‌شود.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[back_button("admin_toggle_maintenance")]]),
     )
@@ -8429,10 +8446,12 @@ async def maint_timed_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ عدد معتبر بین ۰.۱ تا ۱۶۸ (ساعت) وارد کنید:")
         return ADMIN_MAINT_HOURS
 
-    end_dt = datetime.now() + timedelta(hours=hours)
+    # محاسبه با ساعت ایران تا با ساعت کاربر یکی باشد
+    start_dt = now_tehran()
+    end_dt = start_dt + timedelta(hours=hours)
     await set_setting("maintenance", "1")
     await set_setting("maintenance_until", end_dt.isoformat())
-    mins = int(hours * 60)
+    mins = int(round(hours * 60))
     if mins >= 60:
         dur = f"{mins // 60} ساعت و {mins % 60} دقیقه" if mins % 60 else f"{mins // 60} ساعت"
     else:
@@ -8442,7 +8461,8 @@ async def maint_timed_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔴 <b>تعمیرات زمان‌دار فعال شد</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"⏱ مدت: <b>{dur}</b>\n"
-        f"🕐 پایان: <b>{end_dt.strftime('%Y-%m-%d %H:%M')}</b>\n\n"
+        f"🕐 شروع (ایران): <b>{start_dt.strftime('%Y/%m/%d %H:%M')}</b>\n"
+        f"🕐 پایان (ایران): <b>{end_dt.strftime('%Y/%m/%d %H:%M')}</b>\n\n"
         f"پس از این زمان، ربات خودکار از حالت تعمیرات خارج می‌شود.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard(True),
