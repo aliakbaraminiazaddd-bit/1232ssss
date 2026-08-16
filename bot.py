@@ -133,7 +133,11 @@ logger = logging.getLogger(__name__)
     ADMIN_SQA_ADD_TITLE,
     ADMIN_SQA_ADD_ANSWER,
     ADMIN_SQA_EDIT_ANSWER,
-) = range(73)
+    # فروش ربات خام
+    BOTSHOP_WAITING_TOKEN,
+    BOTSHOP_WAITING_RECEIPT,
+    ADMIN_BOTSHOP_PRICE,
+) = range(76)
 
 # ==================== دیتابیس ====================
 async def init_db():
@@ -365,6 +369,20 @@ async def init_db():
                 created_at TEXT
             )
         """)
+        # لایسنس فروش ربات خام (نسخه رایگان/پولی)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_licenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                price INTEGER DEFAULT 0,
+                expires_at TEXT,
+                delivered_at TEXT,
+                bot_token_hint TEXT,
+                created_at TEXT
+            )
+        """)
         await db.commit()
 
         # اطمینان از وجود ادمین اصلی
@@ -466,6 +484,10 @@ async def init_db():
             ("service_days", "30"),
             ("maintenance", "0"),
             ("maintenance_until", ""),
+            ("bot_shop_enabled", "1"),
+            ("bot_shop_price_month", "500000"),
+            ("bot_shop_free_hours", "1"),
+
             ("channel_username", CHANNEL_USERNAME),
             ("custom_price_per_gb", "12000"),   # قیمت هر گیگ در پلن دلخواه
             ("custom_price_per_day", "3000"),   # قیمت هر روز در پلن دلخواه
@@ -1093,6 +1115,7 @@ def main_keyboard(is_admin: bool = False):
             InlineKeyboardButton("📜 قوانین", callback_data="rules"),
             InlineKeyboardButton("📊 تعرفه اشتراک‌ها", callback_data="tariffs_menu"),
         ],
+        [InlineKeyboardButton("🤖 دریافت ربات خام (اختصاصی)", callback_data="bot_shop")],
     ]
 
     if is_admin:
@@ -10707,6 +10730,7 @@ async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏱ تغییر مدت سرویس", callback_data="admin_set_service_days")],
         [InlineKeyboardButton("🧪 تغییر حجم اکانت تست", callback_data="admin_set_test_volume")],
         [InlineKeyboardButton("🔧 مدیریت تعمیرات (دستی/زمان‌دار)", callback_data="admin_toggle_maintenance")],
+        [InlineKeyboardButton("🤖 فروش ربات خام", callback_data="admin_botshop_settings")],
         [InlineKeyboardButton("📢 مدیریت کانال‌های جوین اجباری", callback_data="admin_manage_channels")],
         [InlineKeyboardButton("🔄 ریست تست همه کاربران", callback_data="admin_reset_all_tests")],
         [InlineKeyboardButton("🖥 مدیریت پنل‌ها", callback_data="admin_panels")],
@@ -11684,6 +11708,564 @@ async def admin_proxy_set_price(update: Update, context: ContextTypes.DEFAULT_TY
 async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
+
+# ==================== فروش ربات خام ====================
+def _bot_source_path() -> str:
+    for candidate in (
+        os.path.abspath(__file__) if "__file__" in globals() else "",
+        "bot.py",
+        "/home/workdir/artifacts/bot.py",
+    ):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    try:
+        return os.path.abspath(__file__)
+    except Exception:
+        return "bot.py"
+
+
+def build_blank_bot_source(buyer_token: str, buyer_admin_id: int, expires_at: datetime, plan: str) -> str:
+    import re as _re
+    src_path = _bot_source_path()
+    with open(src_path, "r", encoding="utf-8") as f:
+        src = f.read()
+
+    def repl_assign(name: str, value: str, src_text: str) -> str:
+        pat = r'^(' + name + r'\s*=\s*)([\'"]).*\2'
+        return _re.sub(pat, r'\1"' + value + r'"', src_text, count=1, flags=_re.M)
+
+    src = repl_assign("BOT_TOKEN", buyer_token.strip(), src)
+    src = _re.sub(
+        r"^ADMIN_ID\s*=\s*\d+",
+        "ADMIN_ID = " + str(int(buyer_admin_id)),
+        src,
+        count=1,
+        flags=_re.M,
+    )
+    src = repl_assign("CHANNEL_USERNAME", "", src)
+    src = repl_assign("SUPPORT_USERNAME", "", src)
+    src = repl_assign("CARD_NUMBER", "YOUR_CARD_NUMBER", src)
+    src = repl_assign("CARD_NAME", "YOUR_NAME", src)
+    src = repl_assign("PANEL_URL", "https://YOUR_PANEL_URL", src)
+    src = repl_assign("PANEL_USERNAME", "admin", src)
+    src = repl_assign("PANEL_PASSWORD", "CHANGE_ME", src)
+
+    exp_iso = expires_at.strftime("%Y-%m-%dT%H:%M:%S")
+    license_block = (
+        "\n# ===== لایسنس ربات خام (تولید خودکار) =====\n"
+        "LICENSE_PLAN = %r\n"
+        "LICENSE_EXPIRES_AT = %r  # به وقت ایران\n"
+        "LICENSE_BUYER_ID = %d\n\n"
+        "def _check_bot_license():\n"
+        "    try:\n"
+        "        from datetime import datetime as _dt\n"
+        "        try:\n"
+        "            from zoneinfo import ZoneInfo as _ZI\n"
+        "            now = _dt.now(_ZI('Asia/Tehran')).replace(tzinfo=None)\n"
+        "        except Exception:\n"
+        "            now = _dt.now()\n"
+        "        exp = _dt.fromisoformat(LICENSE_EXPIRES_AT)\n"
+        "        if now >= exp:\n"
+        "            print('=' * 50)\n"
+        "            print('مهلت استفاده از این ربات به پایان رسیده است.')\n"
+        "            print('پلن:', LICENSE_PLAN, '| انقضا:', LICENSE_EXPIRES_AT)\n"
+        "            print('برای تمدید با فروشنده ربات در ارتباط باشید.')\n"
+        "            print('=' * 50)\n"
+        "            raise SystemExit(1)\n"
+        "    except SystemExit:\n"
+        "        raise\n"
+        "    except Exception as _e:\n"
+        "        print('license check warning:', _e)\n\n"
+    ) % (plan, exp_iso, int(buyer_admin_id))
+
+    if "def main():" in src and "_check_bot_license" not in src:
+        src = src.replace("def main():", license_block + "def main():", 1)
+        src = src.replace(
+            "application = Application.builder().token(BOT_TOKEN).build()",
+            "_check_bot_license()\n    application = Application.builder().token(BOT_TOKEN).build()",
+            1,
+        )
+
+    try:
+        if BOT_TOKEN and BOT_TOKEN in src and buyer_token.strip() != BOT_TOKEN:
+            src = src.replace(BOT_TOKEN, buyer_token.strip())
+    except Exception:
+        pass
+
+    header = (
+        "# RBOT blank instance | plan=%s | expires=%s | admin=%s\n"
+        "# فایل خام: تعرفه/پنل/کارت را خودتان تنظیم کنید. bot.db با اولین اجرا ساخته می‌شود.\n\n"
+    ) % (plan, exp_iso, buyer_admin_id)
+    return header + src
+
+
+async def bot_shop_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    enabled = (await get_setting("bot_shop_enabled")) != "0"
+    if not enabled and not await is_admin(query.from_user.id):
+        await query.edit_message_text(
+            "⛔ فروش ربات خام فعلاً غیرفعال است.",
+            reply_markup=InlineKeyboardMarkup([[back_button()]]),
+        )
+        return
+
+    price = await get_int_setting("bot_shop_price_month", 500000)
+    free_h = await get_int_setting("bot_shop_free_hours", 1)
+    uid = query.from_user.id
+
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM bot_licenses WHERE user_id = ? AND plan = 'free' AND status = 'delivered'",
+            (uid,),
+        ) as cur:
+            free_used = (await cur.fetchone())[0] > 0
+        async with db.execute(
+            """SELECT plan, expires_at, status FROM bot_licenses
+               WHERE user_id = ? AND status = 'delivered'
+               ORDER BY id DESC LIMIT 1""",
+            (uid,),
+        ) as cur:
+            last = await cur.fetchone()
+
+    last_line = ""
+    if last:
+        last_line = (
+            "\n📦 آخرین لایسنس شما: <b>%s</b>\n"
+            "⏳ انقضا: <code>%s</code>\n"
+        ) % (last[0], (last[1] or "—")[:16].replace("T", " "))
+
+    if not free_used:
+        free_btn = [[InlineKeyboardButton(
+            "🎁 نسخه رایگان (%s ساعته)" % free_h,
+            callback_data="botshop_free",
+        )]]
+    else:
+        free_btn = [[InlineKeyboardButton("🎁 نسخه رایگان (قبلاً استفاده شده)", callback_data="noop")]]
+
+    kb = InlineKeyboardMarkup(
+        free_btn
+        + [
+            [InlineKeyboardButton(
+                "💎 نسخه پولی ۱ ماهه — %s تومان" % f"{price:,}",
+                callback_data="botshop_paid",
+            )],
+            [back_button()],
+        ]
+    )
+    await query.edit_message_text(
+        "🤖 <b>دریافت ربات خام اختصاصی</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "یک کپی <b>خام</b> از همین ربات فروش دریافت می‌کنید:\n"
+        "• بدون پنل تنظیم‌شده\n"
+        "• بدون کارت و کانال\n"
+        "• تعرفه‌ها را خودتان می‌سازید\n\n"
+        "بعد از انتخاب پلن، توکن ربات خود را می‌دهید و فایل آماده اجرا ارسال می‌شود.\n\n"
+        "🎁 رایگان: <b>%s ساعت</b> (یک‌بار برای هر کاربر)\n"
+        "💎 پولی: <b>۳۰ روز</b> — %s تومان\n"
+        "%s"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "پس از پایان مهلت، ربات روی سرور شما اجرا نمی‌شود."
+        % (free_h, f"{price:,}", last_line),
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def botshop_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    free_h = await get_int_setting("bot_shop_free_hours", 1)
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM bot_licenses WHERE user_id = ? AND plan = 'free' AND status = 'delivered'",
+            (uid,),
+        ) as cur:
+            if (await cur.fetchone())[0] > 0:
+                await query.answer("قبلاً از نسخه رایگان استفاده کرده‌اید.", show_alert=True)
+                return
+    context.user_data["botshop_plan"] = "free"
+    context.user_data["botshop_hours"] = free_h
+    context.user_data["botshop_price"] = 0
+    await query.edit_message_text(
+        "🎁 <b>نسخه رایگان</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "مهلت اجرا: <b>%s ساعت</b> از زمان ساخت فایل\n\n"
+        "توکن ربات خود را از @BotFather بسازید و اینجا ارسال کنید:\n"
+        "فرمت: <code>123456789:AA....</code>" % free_h,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[back_button("bot_shop")]]),
+    )
+    return BOTSHOP_WAITING_TOKEN
+
+
+async def botshop_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    price = await get_int_setting("bot_shop_price_month", 500000)
+    uid = query.from_user.id
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+    balance = row[0] if row else 0
+    context.user_data["botshop_plan"] = "month"
+    context.user_data["botshop_hours"] = 24 * 30
+    context.user_data["botshop_price"] = price
+    buttons = []
+    if balance >= price:
+        buttons.append([InlineKeyboardButton("💰 پرداخت با کیف پول", callback_data="botshop_pay_wallet")])
+    buttons.append([InlineKeyboardButton("📤 پرداخت با کارت (ارسال رسید)", callback_data="botshop_pay_card")])
+    buttons.append([back_button("bot_shop")])
+    await query.edit_message_text(
+        "💎 <b>نسخه پولی ۱ ماهه</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💰 مبلغ: <b>%s</b> تومان\n"
+        "⏳ مدت اجرا: <b>۳۰ روز</b>\n"
+        "💳 موجودی کیف پول: <b>%s</b> تومان\n\n"
+        "💳 کارت: <code>%s</code>\n"
+        "👤 %s\n\n"
+        "پس از تأیید پرداخت، توکن ربات را می‌گیرید و فایل خام ارسال می‌شود."
+        % (f"{price:,}", f"{balance:,}", CARD_NUMBER, CARD_NAME),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def botshop_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    price = context.user_data.get("botshop_price") or await get_int_setting("bot_shop_price_month", 500000)
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+        balance = row[0] if row else 0
+        if balance < price:
+            await query.answer("موجودی کافی نیست", show_alert=True)
+            return
+        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, uid))
+        cur = await db.execute(
+            "INSERT INTO bot_licenses (user_id, plan, status, price, created_at) VALUES (?, 'month', 'paid', ?, ?)",
+            (uid, price, datetime.now().isoformat()),
+        )
+        lic_id = cur.lastrowid
+        await db.commit()
+    context.user_data["botshop_plan"] = "month"
+    context.user_data["botshop_hours"] = 24 * 30
+    context.user_data["botshop_license_id"] = lic_id
+    context.user_data["botshop_price"] = price
+    try:
+        await notify_admin_sale(
+            context.bot, kind="service", order_id=lic_id, user_id=uid,
+            amount=price, plan="ربات خام ۱ ماهه", payment="کیف پول",
+        )
+    except Exception:
+        pass
+    await query.edit_message_text(
+        "✅ پرداخت با کیف پول انجام شد.\n\nحالا <b>توکن ربات</b> خود را ارسال کنید:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[back_button("bot_shop")]]),
+    )
+    return BOTSHOP_WAITING_TOKEN
+
+
+async def botshop_pay_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    price = context.user_data.get("botshop_price") or await get_int_setting("bot_shop_price_month", 500000)
+    context.user_data["botshop_plan"] = "month"
+    context.user_data["botshop_hours"] = 24 * 30
+    context.user_data["botshop_price"] = price
+    await query.edit_message_text(
+        "📤 رسید واریز <b>%s</b> تومان را ارسال کنید (عکس یا فایل).\n\n💳 <code>%s</code>\n👤 %s"
+        % (f"{price:,}", CARD_NUMBER, CARD_NAME),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[back_button("bot_shop")]]),
+    )
+    return BOTSHOP_WAITING_RECEIPT
+
+
+async def botshop_receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    price = context.user_data.get("botshop_price") or await get_int_setting("bot_shop_price_month", 500000)
+    file_uid = get_receipt_unique_id(update.message)
+    if file_uid and await is_receipt_used(file_uid):
+        await update.message.reply_text("❌ این رسید قبلاً استفاده شده است.")
+        return BOTSHOP_WAITING_RECEIPT
+    if not await check_receipt_rate_limit(user.id):
+        await update.message.reply_text("❌ تعداد ارسال رسید بیش از حد مجاز است.")
+        return BOTSHOP_WAITING_RECEIPT
+    if file_uid:
+        await store_receipt_id(file_uid, user.id, "botshop")
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute(
+            "INSERT INTO bot_licenses (user_id, plan, status, price, created_at) VALUES (?, 'month', 'pending', ?, ?)",
+            (user.id, price, datetime.now().isoformat()),
+        )
+        lic_id = cur.lastrowid
+        await db.commit()
+    caption = (
+        "🤖 <b>درخواست ربات خام ۱ ماهه</b>\n━━━━━━━━━━━━━━━━━━\n"
+        "🆔 لایسنس: #%s\n👤 %s (@%s)\n🆔 <code>%s</code>\n💰 مبلغ: <b>%s</b> تومان"
+    ) % (lic_id, user.full_name, user.username or "—", user.id, f"{price:,}")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تأیید", callback_data="botshop_approve_%s" % lic_id),
+        InlineKeyboardButton("❌ رد", callback_data="botshop_reject_%s" % lic_id),
+    ]])
+    try:
+        if update.message.photo:
+            await context.bot.send_photo(ADMIN_ID, photo=update.message.photo[-1].file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+        elif update.message.document:
+            await context.bot.send_document(ADMIN_ID, document=update.message.document.file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await context.bot.send_message(ADMIN_ID, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        logger.error("botshop receipt admin: %s", e)
+    await update.message.reply_text(
+        "✅ رسید ثبت شد (لایسنس #%s).\nپس از تأیید ادمین، توکن ربات از شما گرفته می‌شود." % lic_id,
+        reply_markup=main_keyboard(await is_admin(user.id)),
+    )
+    return ConversationHandler.END
+
+
+async def botshop_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    lic_id = int(query.data.split("_")[-1])
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT user_id, status, price FROM bot_licenses WHERE id = ?", (lic_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await query.answer("یافت نشد", show_alert=True)
+            return
+        uid, status, price = row
+        if status != "pending":
+            await query.answer("قبلاً بررسی شده", show_alert=True)
+            return
+        await db.execute("UPDATE bot_licenses SET status = 'paid' WHERE id = ?", (lic_id,))
+        await db.commit()
+    try:
+        await context.bot.send_message(
+            uid,
+            "✅ پرداخت ربات خام ۱ ماهه تأیید شد.\nروی دکمه زیر بزنید و توکن را بفرستید.\n🔖 لایسنس #%s" % lic_id,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🤖 ارسال توکن و دریافت فایل", callback_data="botshop_token_%s" % lic_id)]
+            ]),
+        )
+    except Exception as e:
+        logger.error("botshop approve notify: %s", e)
+    try:
+        if query.message.caption is not None:
+            await query.edit_message_caption(caption=(query.message.caption or "") + "\n\n✅ تأیید شد", reply_markup=None)
+        else:
+            await query.edit_message_text((query.message.text or "") + "\n\n✅ تأیید شد", reply_markup=None)
+    except Exception:
+        pass
+
+
+async def botshop_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    lic_id = int(query.data.split("_")[-1])
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT user_id, status FROM bot_licenses WHERE id = ?", (lic_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return
+        uid, status = row
+        if status != "pending":
+            await query.answer("قبلاً بررسی شده", show_alert=True)
+            return
+        await db.execute("UPDATE bot_licenses SET status = 'rejected' WHERE id = ?", (lic_id,))
+        await db.commit()
+    try:
+        await context.bot.send_message(uid, "❌ درخواست ربات خام #%s رد شد." % lic_id)
+    except Exception:
+        pass
+    try:
+        if query.message.caption is not None:
+            await query.edit_message_caption(caption=(query.message.caption or "") + "\n\n❌ رد شد", reply_markup=None)
+        else:
+            await query.edit_message_text((query.message.text or "") + "\n\n❌ رد شد", reply_markup=None)
+    except Exception:
+        pass
+
+
+async def botshop_token_from_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lic_id = int(query.data.split("_")[-1])
+    uid = query.from_user.id
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT user_id, plan, status FROM bot_licenses WHERE id = ?", (lic_id,)) as cur:
+            row = await cur.fetchone()
+    if not row or row[0] != uid or row[2] not in ("paid", "delivered"):
+        await query.answer("مجاز نیست", show_alert=True)
+        return
+    context.user_data["botshop_plan"] = "month" if row[1] != "free" else "free"
+    context.user_data["botshop_hours"] = 24 * 30 if row[1] != "free" else await get_int_setting("bot_shop_free_hours", 1)
+    context.user_data["botshop_license_id"] = lic_id
+    context.user_data["botshop_price"] = 0
+    await query.edit_message_text(
+        "توکن ربات خود را ارسال کنید:\n<code>123456:AA...</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    return BOTSHOP_WAITING_TOKEN
+
+
+async def botshop_receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token = (update.message.text or "").strip()
+    if ":" not in token or len(token) < 30 or not token.split(":")[0].isdigit():
+        await update.message.reply_text(
+            "❌ توکن نامعتبر است.\nفرمت: <code>123456789:AAHxxxx</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return BOTSHOP_WAITING_TOKEN
+
+    user = update.effective_user
+    plan = context.user_data.get("botshop_plan") or "free"
+    hours = context.user_data.get("botshop_hours") or 1
+    price = context.user_data.get("botshop_price") or 0
+    lic_id = context.user_data.get("botshop_license_id")
+    expires = now_tehran() + timedelta(hours=float(hours))
+    try:
+        content = build_blank_bot_source(token, user.id, expires, plan)
+    except Exception as e:
+        logger.error("build_blank_bot_source: %s", e)
+        await update.message.reply_text("❌ خطا در ساخت فایل:\n%s" % e)
+        return ConversationHandler.END
+
+    async with aiosqlite.connect("bot.db") as db:
+        if lic_id:
+            await db.execute(
+                """UPDATE bot_licenses SET status='delivered', expires_at=?, delivered_at=?, bot_token_hint=?
+                   WHERE id=? AND user_id=?""",
+                (expires.isoformat(), datetime.now().isoformat(), token[:10] + "…", lic_id, user.id),
+            )
+        else:
+            cur = await db.execute(
+                """INSERT INTO bot_licenses
+                   (user_id, plan, status, price, expires_at, delivered_at, bot_token_hint, created_at)
+                   VALUES (?, ?, 'delivered', ?, ?, ?, ?, ?)""",
+                (user.id, plan, price, expires.isoformat(), datetime.now().isoformat(),
+                 token[:10] + "…", datetime.now().isoformat()),
+            )
+            lic_id = cur.lastrowid
+        await db.commit()
+
+    bio = BytesIO(content.encode("utf-8"))
+    fname = "bot_blank_%s_%s.py" % (user.id, plan)
+    bio.name = fname
+    bio.seek(0)
+    caption = (
+        "✅ <b>ربات خام شما آماده است</b>\n━━━━━━━━━━━━━━━━━━\n"
+        "📦 پلن: <b>%s</b>\n"
+        "⏳ انقضا (ایران): <b>%s</b>\n"
+        "🔖 لایسنس: #%s\n\n"
+        "📌 راهنما:\n"
+        "۱) <code>pip install python-telegram-bot aiosqlite httpx qrcode pillow</code>\n"
+        "۲) <code>python %s</code>\n"
+        "۳) از پنل ادمین: پنل، کارت، کانال و تعرفه را تنظیم کنید.\n\n"
+        "⚠️ بعد از تاریخ انقضا ربات اجرا نمی‌شود."
+    ) % (
+        "رایگان" if plan == "free" else "۱ ماهه",
+        expires.strftime("%Y/%m/%d %H:%M"),
+        lic_id,
+        fname,
+    )
+    await update.message.reply_document(
+        document=InputFile(bio, filename=fname),
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(await is_admin(user.id)),
+    )
+    try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            "🤖 فایل ربات خام تحویل شد\n👤 %s (<code>%s</code>)\nپلن: %s | #%s\nانقضا: %s"
+            % (user.full_name, user.id, plan, lic_id, expires.strftime("%Y/%m/%d %H:%M")),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+    for k in list(context.user_data.keys()):
+        if str(k).startswith("botshop_"):
+            context.user_data.pop(k, None)
+    return ConversationHandler.END
+
+
+async def admin_botshop_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    enabled = (await get_setting("bot_shop_enabled")) != "0"
+    price = await get_int_setting("bot_shop_price_month", 500000)
+    free_h = await get_int_setting("bot_shop_free_hours", 1)
+    async with aiosqlite.connect("bot.db") as db:
+        async with db.execute("SELECT COUNT(*) FROM bot_licenses WHERE status='delivered'") as cur:
+            delivered = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM bot_licenses WHERE status='pending'") as cur:
+            pending = (await cur.fetchone())[0]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🔴 غیرفعال کردن فروش" if enabled else "🟢 فعال کردن فروش",
+            callback_data="botshop_toggle_enabled",
+        )],
+        [InlineKeyboardButton("💰 تغییر قیمت ماهانه", callback_data="admin_botshop_set_price")],
+        [back_button("admin_settings")],
+    ])
+    await query.edit_message_text(
+        "🤖 <b>تنظیمات فروش ربات خام</b>\n━━━━━━━━━━━━━━━━━━\n"
+        "وضعیت: <b>%s</b>\nقیمت ۱ ماهه: <b>%s</b> تومان\nمدت رایگان: <b>%s</b> ساعت\n"
+        "تحویل‌شده: <b>%s</b> | در انتظار: <b>%s</b>"
+        % ("🟢 فعال" if enabled else "🔴 خاموش", f"{price:,}", free_h, delivered, pending),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def botshop_toggle_enabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cur = await get_setting("bot_shop_enabled")
+    await set_setting("bot_shop_enabled", "0" if cur != "0" else "1")
+    await admin_botshop_settings(update, context)
+
+
+async def admin_botshop_set_price_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    price = await get_int_setting("bot_shop_price_month", 500000)
+    await query.edit_message_text(
+        "قیمت فعلی: <b>%s</b> تومان\n\nقیمت جدید ماهانه را بفرستید:" % f"{price:,}",
+        parse_mode=ParseMode.HTML,
+    )
+    return ADMIN_BOTSHOP_PRICE
+
+
+async def admin_botshop_set_price_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = int(update.message.text.strip().replace(",", ""))
+        if price < 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("عدد معتبر وارد کنید:")
+        return ADMIN_BOTSHOP_PRICE
+    await set_setting("bot_shop_price_month", str(price))
+    await update.message.reply_text(
+        "✅ قیمت ربات خام ۱ ماهه: <b>%s</b> تومان" % f"{price:,}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(True),
+    )
+    return ConversationHandler.END
+
+
 # ==================== main ====================
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -11747,6 +12329,12 @@ def main():
             CallbackQueryHandler(maint_timed_start, pattern="^maint_timed$"),
             CallbackQueryHandler(sqa_add_start, pattern="^sqa_add$"),
             CallbackQueryHandler(sqa_edit_start, pattern="^sqa_edit_"),
+            CallbackQueryHandler(botshop_free, pattern="^botshop_free$"),
+            CallbackQueryHandler(botshop_pay_wallet, pattern="^botshop_pay_wallet$"),
+            CallbackQueryHandler(botshop_pay_card, pattern="^botshop_pay_card$"),
+            CallbackQueryHandler(botshop_token_from_btn, pattern="^botshop_token_"),
+            CallbackQueryHandler(admin_botshop_set_price_start, pattern="^admin_botshop_set_price$"),
+
 
             CallbackQueryHandler(admin_add_channel, pattern="^admin_add_channel$"),
             CallbackQueryHandler(admin_add_panel, pattern="^admin_add_panel$"),
@@ -11830,6 +12418,10 @@ def main():
             ADMIN_SQA_ADD_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sqa_add_title)],
             ADMIN_SQA_ADD_ANSWER: [MessageHandler(filters.TEXT & ~filters.COMMAND, sqa_add_answer)],
             ADMIN_SQA_EDIT_ANSWER: [MessageHandler(filters.TEXT & ~filters.COMMAND, sqa_edit_answer)],
+            BOTSHOP_WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botshop_receive_token)],
+            BOTSHOP_WAITING_RECEIPT: [MessageHandler(filters.PHOTO | filters.Document.ALL, botshop_receive_receipt)],
+            ADMIN_BOTSHOP_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_botshop_set_price_do)],
+
 
             ADMIN_SET_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_do_set_channel)],
             ADMIN_PANEL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel_name)],
@@ -11887,6 +12479,7 @@ def main():
             CallbackQueryHandler(write_ticket, pattern="^write_ticket$"),
             CallbackQueryHandler(referral, pattern="^referral$"),
             CallbackQueryHandler(rules, pattern="^rules$"),
+            CallbackQueryHandler(bot_shop_menu, pattern="^bot_shop$"),
         ],
         allow_reentry=True
     )
@@ -11964,6 +12557,13 @@ def main():
     application.add_handler(CallbackQueryHandler(maint_off, pattern="^maint_off$"))
     application.add_handler(CallbackQueryHandler(panel_del_cfg_confirm, pattern="^panel_del_cfg_"))
     application.add_handler(CallbackQueryHandler(admin_manage_sqa, pattern="^admin_manage_sqa$"))
+    application.add_handler(CallbackQueryHandler(bot_shop_menu, pattern="^bot_shop$"))
+    application.add_handler(CallbackQueryHandler(botshop_paid, pattern="^botshop_paid$"))
+    application.add_handler(CallbackQueryHandler(botshop_approve, pattern="^botshop_approve_"))
+    application.add_handler(CallbackQueryHandler(botshop_reject, pattern="^botshop_reject_"))
+    application.add_handler(CallbackQueryHandler(admin_botshop_settings, pattern="^admin_botshop_settings$"))
+    application.add_handler(CallbackQueryHandler(botshop_toggle_enabled, pattern="^botshop_toggle_enabled$"))
+
     application.add_handler(CallbackQueryHandler(sqa_del, pattern="^sqa_del_"))
     application.add_handler(CallbackQueryHandler(sqa_reset_defaults, pattern="^sqa_reset_defaults$"))
     application.add_handler(CallbackQueryHandler(admin_panel_cfg_search_start, pattern="^admin_panel_cfg_search$"))
