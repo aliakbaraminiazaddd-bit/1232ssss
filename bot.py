@@ -467,8 +467,8 @@ async def init_db():
             ("maintenance", "0"),
             ("maintenance_until", ""),
             ("channel_username", CHANNEL_USERNAME),
-            ("custom_price_per_gb", "3900"),   # قیمت هر گیگ در پلن دلخواه
-            ("custom_price_per_day", "500"),   # قیمت هر روز در پلن دلخواه
+            ("custom_price_per_gb", "12000"),   # قیمت هر گیگ در پلن دلخواه
+            ("custom_price_per_day", "3000"),   # قیمت هر روز در پلن دلخواه
             ("custom_min_gb", "5"),
             ("custom_max_gb", "200"),
             ("custom_min_days", "7"),
@@ -2016,54 +2016,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
 
-    is_new = await get_or_create_user(user.id, user.username, user.full_name)
-
-    # اطلاع به مالک برای کاربر جدید
-    if is_new:
-        try:
-            uname = f"@{user.username}" if user.username else "—"
-            full_name = user.full_name or "—"
-            ref_info = ""
-            if args and args[0].startswith("ref_"):
-                ref_info = f"\n🎁 از طریق لینک دعوت: <code>{args[0][4:]}</code>"
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"🆕 <b>کاربر جدید وارد ربات شد</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"👤 نام: {full_name}\n"
-                f"🔗 یوزرنیم: {uname}\n"
-                f"🆔 آیدی: <code>{user.id}</code>\n"
-                f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                f"{ref_info}",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            logger.error(f"notify admin new user: {e}")
-
     if args and args[0].startswith("ref_"):
         ref_code = args[0][4:]
         async with aiosqlite.connect("bot.db") as db:
             async with db.execute("SELECT user_id FROM users WHERE referral_code = ?", (ref_code,)) as cur:
                 row = await cur.fetchone()
-            if row and row[0] != user.id and is_new:
-                bonus = await get_int_setting("referral_bonus", 5000)
-                await db.execute(
-                    "UPDATE users SET referred_by = ? WHERE user_id = ?",
-                    (row[0], user.id)
-                )
-                await db.execute(
-                    "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-                    (bonus, row[0])
-                )
-                await db.commit()
-                try:
-                    await context.bot.send_message(
-                        row[0],
-                        f"🎉 یک نفر با لینک دعوت شما وارد ربات شد!\n"
-                        f"مبلغ {bonus:,} تومان به کیف پول شما اضافه شد."
+            if row and row[0] != user.id:
+                is_new = await get_or_create_user(user.id, user.username, user.full_name)
+                if is_new:
+                    bonus = await get_int_setting("referral_bonus", 5000)
+                    await db.execute(
+                        "UPDATE users SET referred_by = ? WHERE user_id = ?",
+                        (row[0], user.id)
                     )
-                except:
-                    pass
+                    await db.execute(
+                        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                        (bonus, row[0])
+                    )
+                    await db.commit()
+                    try:
+                        await context.bot.send_message(
+                            row[0],
+                            f"🎉 یک نفر با لینک دعوت شما وارد ربات شد!\n"
+                            f"مبلغ {bonus:,} تومان به کیف پول شما اضافه شد."
+                        )
+                    except:
+                        pass
+
+    await get_or_create_user(user.id, user.username, user.full_name)
 
     if await is_banned(user.id):
         await update.message.reply_text("🚫 شما از استفاده از این ربات محروم شده‌اید.")
@@ -2237,8 +2217,8 @@ async def start_custom_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     min_gb = await get_int_setting("custom_min_gb", 5)
     max_gb = await get_int_setting("custom_max_gb", 200)
-    price_gb = await get_int_setting("custom_price_per_gb", 3900)
-    price_day = await get_int_setting("custom_price_per_day", 500)
+    price_gb = await get_int_setting("custom_price_per_gb", 12000)
+    price_day = await get_int_setting("custom_price_per_day", 3000)
 
     context.user_data["server_type"] = "custom"
     context.user_data["discount_code"] = None
@@ -2299,8 +2279,8 @@ async def custom_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     context.user_data["custom_days"] = days
     gb = context.user_data["volume"]
-    price_gb = await get_int_setting("custom_price_per_gb", 3900)
-    price_day = await get_int_setting("custom_price_per_day", 500)
+    price_gb = await get_int_setting("custom_price_per_gb", 12000)
+    price_day = await get_int_setting("custom_price_per_day", 3000)
 
     price = (gb * price_gb) + (days * price_day)
     context.user_data["price"] = price
@@ -2769,8 +2749,8 @@ async def remove_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # قیمت پلن دلخواه از قبل محاسبه شده — دوباره از volume/days حساب نکن
         gb = context.user_data.get("volume", 0)
         d = context.user_data.get("custom_days", 30)
-        price_gb = await get_int_setting("custom_price_per_gb", 3900)
-        price_day = await get_int_setting("custom_price_per_day", 500)
+        price_gb = await get_int_setting("custom_price_per_gb", 12000)
+        price_day = await get_int_setting("custom_price_per_day", 3000)
         context.user_data["final_price"] = (gb * price_gb) + (d * price_day)
     else:
         context.user_data["final_price"] = base
